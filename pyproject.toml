@@ -1,0 +1,14 @@
+[project]
+name = "ai-learn-mini-agent"
+version = "0.1.0"
+description = "A from-scratch learning project for building coding agents in Python."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
