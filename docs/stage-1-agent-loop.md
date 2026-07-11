@@ -42,21 +42,21 @@ message history -> LLM decision -> optional tool call -> observation -> next dec
 2. 工具结果必须回到消息历史里，否则模型无法基于执行结果继续推理。
 3. `max_steps` 是安全阀，防止模型或工具错误导致无限循环。
 
-## 练习
+## Iteration 1：严格工具契约
 
-请你自己完成一个小工具：
+项目已经加入一个贯通工具调用链路的小工具：
 
 ```text
 get_file_stats(path) -> 返回文件字节数、行数、字符数
 ```
 
-建议步骤：
+它对应的实现步骤是：
 
-1. 在 `mini_agent/tools.py` 里新增内部函数 `get_file_stats`。
-2. 在 `create_default_registry` 里注册工具。
-3. 在 `mini_agent/llm.py` 里让 `MockLLM` 支持 `stats README.md`。
-4. 在 `tests/test_tools.py` 里写一个测试。
-5. 运行 `python -m pytest -q`。
+1. 使用 JSON Schema 定义每个工具的合法参数。
+2. 在 `ToolRegistry.run` 执行前统一验证模型参数。
+3. 把失败转换成带错误代码的 JSON observation。
+4. 注册 `get_file_stats` 并让 `MockLLM` 支持 `stats README.md`。
+5. 用工具测试和 Agent 测试验证完整链路。
 
 这个练习很小，但它会让你亲手走过“新增 agent 能力”的完整路径。
 

@@ -58,6 +58,13 @@ class MockLLM(LLM):
                 tool_call=ToolCall("search_files", {"query": prompt[7:].strip()}),
             )
 
+        if lowered.startswith("stats "):
+            # 这一规则用于演示：新增能力需要模型选择与工具 Schema 两端同时接通。
+            return LLMResponse(
+                content="I should inspect the requested file metadata.",
+                tool_call=ToolCall("get_file_stats", {"path": prompt[6:].strip()}),
+            )
+
         if lowered.startswith("run "):
             command = prompt[4:].strip()
             # shlex.split 在这里不是为了执行命令，而是提前发现明显不完整的 shell 输入。

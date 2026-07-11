@@ -3,7 +3,9 @@ name = "ai-learn-mini-agent"
 version = "0.1.0"
 description = "A from-scratch learning project for building coding agents in Python."
 requires-python = ">=3.9"
-dependencies = []
+dependencies = [
+    "jsonschema>=4.23,<5",
+]
 
 [project.optional-dependencies]
 dev = [

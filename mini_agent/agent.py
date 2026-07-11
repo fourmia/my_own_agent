@@ -69,7 +69,7 @@ class Agent:
             # 工具是 agent 观察外部世界的方式：读文件、跑命令、搜索、访问 API 等。
             # 工具执行结果不直接返回给用户，而是先回到模型上下文里。
             result = self.tools.run(call)
-            observation = result.content if result.ok else f"ERROR: {result.content}"
+            observation = result.to_observation()
             messages.append(Message("tool", observation))
 
             if trace:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator
 
 from mini_agent.schema import ToolCall, ToolResult
 
@@ -26,7 +29,7 @@ class Tool:
 
     name: str
     description: str
-    parameters: dict[str, str]
+    parameters: dict[str, Any]
     fn: ToolFn
 
 
@@ -41,11 +44,16 @@ class ToolRegistry:
         # root 是当前工作区根目录。所有文件读写都必须限制在这个目录内。
         self.root = root.resolve()
         self._tools: dict[str, Tool] = {}
+        # Validator 与工具同生命周期缓存，避免每次调用都重新解析 JSON Schema。
+        self._validators: dict[str, Draft202012Validator] = {}
 
     def register(self, tool: Tool) -> None:
         # 后注册的同名工具会覆盖旧工具。教学项目里保持简单；
         # 生产系统通常会拒绝重复注册，避免工具被意外替换。
+        # 注册时先验证 Schema 本身，让开发错误在启动阶段暴露，而不是等模型调用。
+        Draft202012Validator.check_schema(tool.parameters)
         self._tools[tool.name] = tool
+        self._validators[tool.name] = Draft202012Validator(tool.parameters)
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -58,7 +66,32 @@ class ToolRegistry:
         # 只允许调用已注册工具。模型编造出的工具名会被当成一次失败 observation。
         tool = self.get(call.name)
         if tool is None:
-            return ToolResult(call.name, False, f"Unknown tool: {call.name}")
+            return ToolResult(
+                call.name,
+                False,
+                f"Unknown tool: {call.name}",
+                error_code="unknown_tool",
+            )
+
+        # 参数来自模型，必须在进入具体工具函数前经过统一的信任边界。
+        errors = sorted(
+            self._validators[call.name].iter_errors(call.arguments),
+            key=lambda error: list(error.absolute_path),
+        )
+        if errors:
+            # 先返回路径最靠前的错误，使相同输入始终产生确定性的 observation。
+            error = errors[0]
+            location = ".".join(str(part) for part in error.absolute_path) or "$"
+            return ToolResult(
+                call.name,
+                False,
+                f"Invalid arguments at {location}: {error.message}",
+                error_code="invalid_arguments",
+                details={
+                    "location": location,
+                    "validator": error.validator,
+                },
+            )
 
         try:
             # 工具内部抛出的异常不直接杀死 agent，而是包装成 ToolResult。
@@ -66,7 +99,13 @@ class ToolRegistry:
             output = tool.fn(call.arguments)
             return ToolResult(call.name, True, output)
         except Exception as exc:  # noqa: BLE001 - teaching project: tool errors become observations
-            return ToolResult(call.name, False, f"{type(exc).__name__}: {exc}")
+            return ToolResult(
+                call.name,
+                False,
+                f"{type(exc).__name__}: {exc}",
+                error_code="tool_execution_error",
+                details={"exception_type": type(exc).__name__},
+            )
 
     def resolve_workspace_path(self, raw_path: str) -> Path:
         # 这是最小版路径沙箱：把模型提供的相对路径解析成绝对路径，
@@ -151,11 +190,30 @@ def create_default_registry(root: Path) -> ToolRegistry:
             parts.append(f"stderr:\n{error}")
         return "\n".join(parts)
 
+    def get_file_stats(args: dict[str, Any]) -> str:
+        # 复用路径沙箱，统计工具也不能通过 ../ 或绝对路径逃出工作区。
+        path = registry.resolve_workspace_path(str(args["path"]))
+        text = path.read_text(encoding="utf-8")
+        return json.dumps(
+            {
+                "path": str(path.relative_to(registry.root)),
+                # bytes 来自磁盘，characters/lines 来自 UTF-8 解码后的文本；CRLF 下两者可能不同。
+                "bytes": path.stat().st_size,
+                "lines": len(text.splitlines()),
+                "characters": len(text),
+            },
+            ensure_ascii=False,
+        )
+
     registry.register(
         Tool(
             name="list_files",
             description="List files in the current workspace.",
-            parameters={},
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
             fn=list_files,
         )
     )
@@ -163,7 +221,18 @@ def create_default_registry(root: Path) -> ToolRegistry:
         Tool(
             name="read_file",
             description="Read a UTF-8 text file from the workspace.",
-            parameters={"path": "relative file path"},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Workspace-relative file path.",
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
             fn=read_file,
         )
     )
@@ -171,7 +240,22 @@ def create_default_registry(root: Path) -> ToolRegistry:
         Tool(
             name="write_file",
             description="Write a UTF-8 text file inside the workspace.",
-            parameters={"path": "relative file path", "content": "file content"},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Workspace-relative file path.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete UTF-8 file content.",
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
             fn=write_file,
         )
     )
@@ -179,7 +263,18 @@ def create_default_registry(root: Path) -> ToolRegistry:
         Tool(
             name="search_files",
             description="Search text files in the workspace.",
-            parameters={"query": "case-insensitive search string"},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Case-insensitive search string.",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
             fn=search_files,
         )
     )
@@ -187,8 +282,38 @@ def create_default_registry(root: Path) -> ToolRegistry:
         Tool(
             name="run_command",
             description="Run a shell command in the workspace with a short timeout.",
-            parameters={"command": "shell command"},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Shell command to run from the workspace root.",
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
             fn=run_command,
+        )
+    )
+    registry.register(
+        Tool(
+            name="get_file_stats",
+            description="Return byte, line, and character counts for a UTF-8 workspace file.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Workspace-relative UTF-8 file path.",
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            fn=get_file_stats,
         )
     )
     return registry

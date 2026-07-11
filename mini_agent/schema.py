@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any, Literal
 
 
@@ -52,6 +54,30 @@ class ToolResult:
     name: str
     ok: bool
     content: str
+    # error_code 给模型和评估系统一个稳定的机器标识；content 保留给人阅读。
+    error_code: str | None = None
+    # details 只承载可序列化的诊断信息，不放异常对象等进程内状态。
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_observation(self) -> str:
+        """转换成写回模型上下文的稳定 observation 协议。"""
+
+        # 成功结果保持原样，避免给每一次正常 observation 增加额外 JSON 包装。
+        if self.ok:
+            return self.content
+        # 失败统一成固定信封，后续真实 LLM 可以按 code 选择重试、纠参或停止。
+        return json.dumps(
+            {
+                "ok": False,
+                "tool": self.name,
+                "error": {
+                    "code": self.error_code or "tool_error",
+                    "message": self.content,
+                    "details": self.details,
+                },
+            },
+            ensure_ascii=False,
+        )
 
 
 @dataclass(frozen=True)
