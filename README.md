@@ -35,6 +35,8 @@ python -m mini_agent "run python --version"
 - `docs/stage-1-agent-loop.md`：最小 Agent Loop 的核心概念
 - `docs/iteration-1-tool-contracts.md`：严格工具 Schema、参数校验和结构化错误
 - `docs/iteration-2-error-recovery.md`：完整消息历史、错误分类和多轮文件恢复
+- `docs/iteration-3-real-llm-design.md`：真实 LLM Adapter、调用关联和多工具协议设计
+- `docs/adr/0001-own-runtime-use-provider-adapters.md`：自研 Runtime、按边界复用开源方案的架构决策
 
 ## 学习任务
 
