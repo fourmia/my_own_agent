@@ -113,6 +113,6 @@ python -m pytest -q
 
 当前结果为 `6 passed`。
 
-## 下一步
+## 后续迭代
 
-Iteration 2 将让 Agent 识别结构化错误并采取恢复动作。例如读取不存在的文件后，不再直接复述错误，而是调用搜索工具寻找候选文件，再决定重试或向用户报告。
+Iteration 2 已实现，详见 `docs/iteration-2-error-recovery.md`。Agent 现在会识别 `file_not_found`，列出工作区文件，选择可信的相似文件名并进行一次有限重试。

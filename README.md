@@ -8,9 +8,9 @@
 用户目标 -> 模型思考 -> 选择工具 -> 执行工具 -> 观察结果 -> 继续决策 -> 完成
 ```
 
-## 当前阶段：Stage 1 / Iteration 1
+## 当前阶段：Stage 1 / Iteration 2
 
-我们先实现一个不依赖真实大模型的最小智能体。它使用 `MockLLM` 模拟模型决策，并用 JSON Schema 描述和校验工具参数，让你先理解 agent loop、tool schema、observation、迭代上限和结构化工具错误。
+我们先实现一个不依赖真实大模型的最小智能体。它使用 `MockLLM` 模拟模型决策，用 JSON Schema 校验工具参数，并能根据结构化错误执行一次确定性的文件名恢复，让你理解多轮 agent loop、消息历史、错误分类和停止策略。
 
 ## 运行
 
@@ -19,6 +19,7 @@ python -m mini_agent "list files"
 python -m mini_agent "search pyproject"
 python -m mini_agent "read README.md"
 python -m mini_agent "stats README.md"
+python -m mini_agent "read REDME.md"
 python -m mini_agent "run python --version"
 ```
 
@@ -33,13 +34,14 @@ python -m mini_agent "run python --version"
 
 - `docs/stage-1-agent-loop.md`：最小 Agent Loop 的核心概念
 - `docs/iteration-1-tool-contracts.md`：严格工具 Schema、参数校验和结构化错误
+- `docs/iteration-2-error-recovery.md`：完整消息历史、错误分类和多轮文件恢复
 
 ## 学习任务
 
-1. 先运行上面的 4 个命令，观察每一轮 trace。
+1. 先运行上面的命令，观察每一轮 trace。
 2. 阅读 `mini_agent/agent.py`，确认你能说清楚为什么需要 `max_steps`。
-3. 阅读 `tools.py` 中的 JSON Schema，观察缺少参数时的结构化错误。
-4. 阅读 `get_file_stats` 的实现和测试，理解新增工具的完整链路。
+3. 运行 `read REDME.md`，观察 `read_file -> list_files -> read_file` 恢复链路。
+4. 阅读 `llm.py` 的恢复状态机，确认你能解释为什么自动重试必须有限制。
 
 下一阶段我们会接入真实 LLM，并让模型通过 structured output 选择工具。
 

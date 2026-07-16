@@ -18,6 +18,24 @@ from mini_agent.schema import ToolCall, ToolResult
 ToolFn = Callable[[dict[str, Any]], str]
 
 
+class WorkspacePathError(ValueError):
+    """模型提供的路径越过了当前工作区边界。"""
+
+
+class ToolExecutionFailure(RuntimeError):
+    """工具主动报告的、可以安全写回模型上下文的预期失败。"""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
 @dataclass(frozen=True)
 class Tool:
     """对外暴露给模型的工具说明。
@@ -98,6 +116,52 @@ class ToolRegistry:
             # 这让模型可以看到错误，例如“文件不存在”，然后决定下一步怎么修正。
             output = tool.fn(call.arguments)
             return ToolResult(call.name, True, output)
+        except ToolExecutionFailure as exc:
+            # 工具可以主动提供稳定错误码，例如 Shell 非零退出，而不是伪装成成功文本。
+            return ToolResult(
+                call.name,
+                False,
+                str(exc),
+                error_code=exc.code,
+                details=exc.details,
+            )
+        except WorkspacePathError as exc:
+            return ToolResult(
+                call.name,
+                False,
+                str(exc),
+                error_code="path_escape",
+                details={"path": str(call.arguments.get("path", ""))},
+            )
+        except FileNotFoundError:
+            # 不把解析后的绝对路径写回模型，避免 observation 泄漏工作区外的主机信息。
+            raw_path = str(call.arguments.get("path", ""))
+            return ToolResult(
+                call.name,
+                False,
+                f"File not found: {raw_path}",
+                error_code="file_not_found",
+                details={"path": raw_path},
+            )
+        except UnicodeDecodeError as exc:
+            return ToolResult(
+                call.name,
+                False,
+                "File is not valid UTF-8 text.",
+                error_code="invalid_encoding",
+                details={
+                    "path": str(call.arguments.get("path", "")),
+                    "start": exc.start,
+                },
+            )
+        except subprocess.TimeoutExpired as exc:
+            return ToolResult(
+                call.name,
+                False,
+                f"Command timed out after {exc.timeout} seconds.",
+                error_code="command_timeout",
+                details={"timeout_seconds": exc.timeout},
+            )
         except Exception as exc:  # noqa: BLE001 - teaching project: tool errors become observations
             return ToolResult(
                 call.name,
@@ -113,7 +177,7 @@ class ToolRegistry:
         # 例如 "../secret.txt" 会被拒绝。
         path = (self.root / raw_path).resolve()
         if path != self.root and self.root not in path.parents:
-            raise ValueError(f"path escapes workspace: {raw_path}")
+            raise WorkspacePathError(f"path escapes workspace: {raw_path}")
         return path
 
 
@@ -125,12 +189,20 @@ def create_default_registry(root: Path) -> ToolRegistry:
     """
 
     registry = ToolRegistry(root)
+    ignored_directories = {".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
+
+    def is_ignored(path: Path) -> bool:
+        # 工具输出会进入模型上下文；缓存、虚拟环境和安装元数据既耗 Token，也会干扰候选排序。
+        return any(
+            part in ignored_directories or part.endswith(".egg-info")
+            for part in path.parts
+        )
 
     def list_files(_: dict[str, Any]) -> str:
-        # rglob 会递归列出目录。这里跳过 .git 和 __pycache__，减少无关噪声。
+        # rglob 会递归列出目录，is_ignored 负责过滤不应暴露给模型的运行时噪声。
         files = []
         for path in sorted(registry.root.rglob("*")):
-            if ".git" in path.parts or "__pycache__" in path.parts:
+            if is_ignored(path):
                 continue
             if path.is_file():
                 files.append(str(path.relative_to(registry.root)))
@@ -154,7 +226,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
         query = str(args["query"])
         matches: list[str] = []
         for path in sorted(registry.root.rglob("*")):
-            if ".git" in path.parts or "__pycache__" in path.parts or not path.is_file():
+            if is_ignored(path) or not path.is_file():
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
@@ -188,7 +260,15 @@ def create_default_registry(root: Path) -> ToolRegistry:
             parts.append(f"stdout:\n{output}")
         if error:
             parts.append(f"stderr:\n{error}")
-        return "\n".join(parts)
+        result = "\n".join(parts)
+        if completed.returncode != 0:
+            # subprocess.run(check=False) 让我们能保留 stdout/stderr，再用领域错误表达失败。
+            raise ToolExecutionFailure(
+                "command_failed",
+                result,
+                details={"exit_code": completed.returncode},
+            )
+        return result
 
     def get_file_stats(args: dict[str, Any]) -> str:
         # 复用路径沙箱，统计工具也不能通过 ../ 或绝对路径逃出工作区。

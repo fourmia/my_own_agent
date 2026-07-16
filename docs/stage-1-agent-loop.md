@@ -60,3 +60,5 @@ get_file_stats(path) -> 返回文件字节数、行数、字符数
 
 这个练习很小，但它会让你亲手走过“新增 agent 能力”的完整路径。
 
+下一步请阅读 `docs/iteration-2-error-recovery.md`，观察 Agent 如何利用完整消息历史从工具失败中恢复。
+

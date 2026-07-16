@@ -52,7 +52,11 @@ class Agent:
             # 让模型基于“完整消息历史”和“当前可用工具列表”做下一步决策。
             # 在真实 LLM 接入里，tools 通常会被转换成 JSON Schema / function calling schema。
             response = self.llm.next(messages, self.tools.list_tools())
-            messages.append(Message("assistant", response.content))
+            # tool_call 必须随 assistant 消息持久化。模型在后续轮次需要知道：
+            # 哪个 observation 对应哪个参数，而不能依赖打印日志或猜测自然语言。
+            messages.append(
+                Message("assistant", response.content, tool_call=response.tool_call)
+            )
 
             if trace:
                 print(f"\n[step {step}] assistant")
@@ -70,7 +74,7 @@ class Agent:
             # 工具执行结果不直接返回给用户，而是先回到模型上下文里。
             result = self.tools.run(call)
             observation = result.to_observation()
-            messages.append(Message("tool", observation))
+            messages.append(Message("tool", observation, tool_name=call.name))
 
             if trace:
                 print(f"\n[step {step}] observation")

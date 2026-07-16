@@ -25,6 +25,10 @@ class Message:
 
     role: Role
     content: str
+    # assistant 消息保留结构化调用，避免后续模型只能从自然语言反推执行过什么。
+    tool_call: ToolCall | None = None
+    # tool 消息记录结果来源；真实 API 通常还会增加 tool_call_id 关联并行调用。
+    tool_name: str | None = None
 
 
 @dataclass(frozen=True)

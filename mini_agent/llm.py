@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 import shlex
 from abc import ABC, abstractmethod
+from difflib import SequenceMatcher
+from pathlib import PurePosixPath
+from typing import Any
 
 from mini_agent.schema import LLMResponse, Message, ToolCall
 from mini_agent.tools import Tool
@@ -29,17 +33,12 @@ class MockLLM(LLM):
     """
 
     def next(self, messages: list[Message], tools: list[Tool]) -> LLMResponse:
-        # 简化假设：MockLLM 只看最后一条消息。
-        # 真实模型会看完整 messages，并根据上下文做更复杂的推理。
         last = messages[-1]
 
-        # 如果最后一条是 tool，说明工具刚执行完。
-        # MockLLM 在这里直接把观察结果总结为最终回答。
+        # Iteration 2 开始真正使用完整历史：最后一条 observation 决定当前状态，
+        # 更早的 assistant.tool_call 则提供原始参数和已经尝试过的动作。
         if last.role == "tool":
-            return LLMResponse(
-                content=f"I observed the tool result:\n{last.content}",
-                done=True,
-            )
+            return self._after_tool(messages, last)
 
         prompt = last.content.strip()
         lowered = prompt.lower()
@@ -90,3 +89,119 @@ class MockLLM(LLM):
             ),
             done=True,
         )
+
+    def _after_tool(self, messages: list[Message], observation: Message) -> LLMResponse:
+        """根据工具来源、错误码和历史调用选择下一步确定性动作。"""
+
+        error = self._read_error(observation.content)
+
+        if observation.tool_name == "read_file":
+            if error is None:
+                return LLMResponse(
+                    content=f"I observed the tool result:\n{observation.content}",
+                    done=True,
+                )
+
+            if error.get("code") == "file_not_found":
+                # 只允许一次自动恢复。候选文件在重试前消失时，继续循环只会浪费步数。
+                if self._count_tool_calls(messages, "read_file") >= 2:
+                    return LLMResponse(
+                        content="The closest file candidate also disappeared; I stopped retrying.",
+                        done=True,
+                    )
+                return LLMResponse(
+                    content="The file was not found. I should inspect workspace filenames.",
+                    tool_call=ToolCall("list_files", {}),
+                )
+
+            return LLMResponse(
+                content=(
+                    "I could not read the file and this error is not safe to auto-recover: "
+                    f"{error.get('code', 'tool_error')}."
+                ),
+                done=True,
+            )
+
+        if observation.tool_name == "list_files":
+            if error is not None:
+                return LLMResponse(
+                    content="I could not list workspace files, so recovery stopped.",
+                    done=True,
+                )
+
+            requested = self._latest_read_path(messages)
+            candidate = self._closest_file(requested, observation.content)
+            if candidate is None:
+                return LLMResponse(
+                    content=f"I could not find a close filename match for {requested!r}.",
+                    done=True,
+                )
+            return LLMResponse(
+                content=f"I found a likely filename match and should retry with {candidate}.",
+                tool_call=ToolCall("read_file", {"path": candidate}),
+            )
+
+        # 其他工具仍保持 Stage 1 行为；后续迭代会为命令失败等错误增加专门恢复策略。
+        return LLMResponse(
+            content=f"I observed the tool result:\n{observation.content}",
+            done=True,
+        )
+
+    @staticmethod
+    def _read_error(content: str) -> dict[str, Any] | None:
+        """解析 ToolResult 的失败信封；普通文本代表成功 observation。"""
+
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict) or payload.get("ok") is not False:
+            return None
+        error = payload.get("error")
+        return error if isinstance(error, dict) else {"code": "tool_error"}
+
+    @staticmethod
+    def _count_tool_calls(messages: list[Message], name: str) -> int:
+        return sum(
+            1
+            for message in messages
+            if message.tool_call is not None and message.tool_call.name == name
+        )
+
+    @staticmethod
+    def _latest_read_path(messages: list[Message]) -> str:
+        """从历史中的结构化 ToolCall 取路径，而不是解析 assistant 自然语言。"""
+
+        for message in reversed(messages):
+            if message.tool_call is not None and message.tool_call.name == "read_file":
+                return str(message.tool_call.arguments.get("path", ""))
+        return ""
+
+    @staticmethod
+    def _closest_file(requested: str, listing: str) -> str | None:
+        """用确定性相似度选择候选；低于阈值时宁可停止也不读取无关文件。"""
+
+        candidates = [
+            line.strip()
+            for line in listing.splitlines()
+            if line.strip() and line.strip() != "(no files)"
+        ]
+        if not candidates:
+            return None
+
+        normalized_requested = requested.replace("\\", "/")
+        requested_name = PurePosixPath(normalized_requested).name.lower()
+
+        def score(candidate: str) -> float:
+            normalized_candidate = candidate.replace("\\", "/")
+            candidate_name = PurePosixPath(normalized_candidate).name.lower()
+            # 完整路径适合目录拼写错误，basename 适合 README 这类常见文件名拼写错误。
+            return max(
+                SequenceMatcher(
+                    None, normalized_requested.lower(), normalized_candidate.lower()
+                ).ratio(),
+                SequenceMatcher(None, requested_name, candidate_name).ratio(),
+            )
+
+        best = max(candidates, key=lambda candidate: (score(candidate), candidate))
+        return best if score(best) >= 0.6 else None
