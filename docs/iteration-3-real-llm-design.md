@@ -1,6 +1,6 @@
 # Iteration 3：真实 LLM 与原生 Tool Calling 设计
 
-- 状态：Proposed，待实现
+- 状态：3A Implemented，3B Proposed
 - 日期：2026-07-16
 - 首个 Provider：OpenAI Responses API
 - 核心原则：领域协议归 Runtime 所有，SDK 类型限制在 Adapter 内部
@@ -104,9 +104,9 @@ Gajae-Code 在 Agent Loop 内使用自己的 AgentMessage，只在 LLM 调用边
 - [agent-loop.ts](https://github.com/Yeachan-Heo/gajae-code/blob/aedd0df99e7c9dff420b50f7ff47bd6645627bdd/packages/agent/src/agent-loop.ts)
 - [append-only-context.ts](https://github.com/Yeachan-Heo/gajae-code/blob/aedd0df99e7c9dff420b50f7ff47bd6645627bdd/packages/agent/src/append-only-context.ts)
 
-## 4. 当前模型的不足
+## 4. 3A 前的模型不足与已完成修正
 
-当前领域结构：
+3A 前的领域结构：
 
 ```python
 ToolCall(name, arguments)
@@ -114,13 +114,13 @@ ToolResult(name, ok, content, error_code, details)
 LLMResponse(content, tool_call, done)
 ```
 
-存在五个问题：
+3A 已修正前四项；Provider Adapter 的边界在 3B 实现：
 
-1. `ToolCall` 没有稳定 `call_id`。
-2. `LLMResponse` 只能表达一个工具调用。
-3. 文本、拒绝、工具调用和不完整状态被压成一个对象。
-4. 无法保存 Provider response id、Token 使用量和结束原因。
-5. `LLM.next()` 同时承担领域请求和 Provider 映射，扩展第二 Provider 时会泄漏 SDK 类型。
+1. `ToolCall` 没有稳定 `call_id`。已由 3A 修正。
+2. `LLMResponse` 只能表达一个工具调用。已由 `ModelTurn.tool_calls` 修正。
+3. 文本、拒绝、工具调用和不完整状态被压成一个对象。已由 `finish_reason` 修正。
+4. 无法保存 Provider response id、Token 使用量和结束原因。已加入 `provider_response_id` 和 `Usage`。
+5. `LLM.next()` 同时承担领域请求和 Provider 映射。3A 已提供 `generate(ModelRequest)` 边界，3B 将实现具体 Adapter。
 
 ## 5. 领域模型提案
 
@@ -370,13 +370,13 @@ Responses API 可以使用 Provider 侧连续状态，也可以由客户端重�
 
 ## 12. 流式分阶段
 
-### Iteration 3A：非流式核心
+### Iteration 3A：非流式核心（已完成）
 
-- 完成领域类型升级；
-- 实现 FakeProvider；
-- 支持多个 ToolCall；
-- 验证 call_id；
-- 重构现有 MockLLM。
+- [x] 完成领域类型升级；
+- [x] 实现 FakeProvider 测试 Double；
+- [x] 支持多个 ToolCall；
+- [x] 验证 call_id；
+- [x] 重构现有 MockLLM。
 
 ### Iteration 3B：OpenAI 非流式 Adapter
 

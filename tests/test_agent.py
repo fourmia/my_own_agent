@@ -27,6 +27,16 @@ def test_agent_can_read_file(tmp_path: Path) -> None:
     assert result.steps == 2
 
 
+def test_agent_can_list_files_directly(tmp_path: Path) -> None:
+    (tmp_path / "hello.txt").write_text("hello", encoding="utf-8")
+    agent = Agent(MockLLM(), create_default_registry(tmp_path))
+
+    result = agent.run("list files", trace=False)
+
+    assert result.answer == "I observed the tool result:\nhello.txt"
+    assert result.steps == 2
+
+
 def test_agent_can_get_file_stats(tmp_path: Path) -> None:
     (tmp_path / "note.md").write_text("agent loop\n", encoding="utf-8")
     agent = Agent(MockLLM(), create_default_registry(tmp_path))

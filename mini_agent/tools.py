@@ -9,7 +9,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from mini_agent.schema import ToolCall, ToolResult
+from mini_agent.schema import ToolCall, ToolDefinition, ToolResult
 
 
 # 每个工具都是一个普通 Python 函数：
@@ -50,6 +50,15 @@ class Tool:
     parameters: dict[str, Any]
     fn: ToolFn
 
+    def definition(self) -> ToolDefinition:
+        """返回不包含本地 handler 的模型可见工具定义。"""
+
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            parameters=self.parameters,
+        )
+
 
 class ToolRegistry:
     """工具注册表，也是工具执行的安全边界。
@@ -80,14 +89,20 @@ class ToolRegistry:
         # 返回工具元数据。真实 LLM 接入时，会把这些信息转成模型能理解的 schema。
         return list(self._tools.values())
 
+    def list_definitions(self) -> list[ToolDefinition]:
+        """只返回 Provider 需要的工具元数据，不暴露 Python handler。"""
+
+        return [tool.definition() for tool in self._tools.values()]
+
     def run(self, call: ToolCall) -> ToolResult:
         # 只允许调用已注册工具。模型编造出的工具名会被当成一次失败 observation。
         tool = self.get(call.name)
         if tool is None:
             return ToolResult(
-                call.name,
-                False,
-                f"Unknown tool: {call.name}",
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=f"Unknown tool: {call.name}",
                 error_code="unknown_tool",
             )
 
@@ -101,9 +116,10 @@ class ToolRegistry:
             error = errors[0]
             location = ".".join(str(part) for part in error.absolute_path) or "$"
             return ToolResult(
-                call.name,
-                False,
-                f"Invalid arguments at {location}: {error.message}",
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=f"Invalid arguments at {location}: {error.message}",
                 error_code="invalid_arguments",
                 details={
                     "location": location,
@@ -115,21 +131,28 @@ class ToolRegistry:
             # 工具内部抛出的异常不直接杀死 agent，而是包装成 ToolResult。
             # 这让模型可以看到错误，例如“文件不存在”，然后决定下一步怎么修正。
             output = tool.fn(call.arguments)
-            return ToolResult(call.name, True, output)
+            return ToolResult(
+                call_id=call.call_id,
+                name=call.name,
+                ok=True,
+                content=output,
+            )
         except ToolExecutionFailure as exc:
             # 工具可以主动提供稳定错误码，例如 Shell 非零退出，而不是伪装成成功文本。
             return ToolResult(
-                call.name,
-                False,
-                str(exc),
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=str(exc),
                 error_code=exc.code,
                 details=exc.details,
             )
         except WorkspacePathError as exc:
             return ToolResult(
-                call.name,
-                False,
-                str(exc),
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=str(exc),
                 error_code="path_escape",
                 details={"path": str(call.arguments.get("path", ""))},
             )
@@ -137,17 +160,19 @@ class ToolRegistry:
             # 不把解析后的绝对路径写回模型，避免 observation 泄漏工作区外的主机信息。
             raw_path = str(call.arguments.get("path", ""))
             return ToolResult(
-                call.name,
-                False,
-                f"File not found: {raw_path}",
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=f"File not found: {raw_path}",
                 error_code="file_not_found",
                 details={"path": raw_path},
             )
         except UnicodeDecodeError as exc:
             return ToolResult(
-                call.name,
-                False,
-                "File is not valid UTF-8 text.",
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content="File is not valid UTF-8 text.",
                 error_code="invalid_encoding",
                 details={
                     "path": str(call.arguments.get("path", "")),
@@ -156,17 +181,19 @@ class ToolRegistry:
             )
         except subprocess.TimeoutExpired as exc:
             return ToolResult(
-                call.name,
-                False,
-                f"Command timed out after {exc.timeout} seconds.",
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=f"Command timed out after {exc.timeout} seconds.",
                 error_code="command_timeout",
                 details={"timeout_seconds": exc.timeout},
             )
         except Exception as exc:  # noqa: BLE001 - teaching project: tool errors become observations
             return ToolResult(
-                call.name,
-                False,
-                f"{type(exc).__name__}: {exc}",
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=f"{type(exc).__name__}: {exc}",
                 error_code="tool_execution_error",
                 details={"exception_type": type(exc).__name__},
             )
