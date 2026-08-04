@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 from mini_agent.schema import ToolCall
-from mini_agent.tools import create_default_registry
+from mini_agent.tools import create_default_registry, create_read_only_registry
 
 
 def test_read_file(tmp_path: Path) -> None:
@@ -95,4 +95,17 @@ def test_list_files_filters_runtime_noise(tmp_path: Path) -> None:
 
     assert result.ok
     assert result.content == "README.md"
+
+
+def test_read_only_registry_excludes_mutating_tools(tmp_path: Path) -> None:
+    registry = create_read_only_registry(tmp_path)
+
+    assert [tool.name for tool in registry.list_tools()] == [
+        "list_files",
+        "read_file",
+        "search_files",
+        "get_file_stats",
+    ]
+    assert registry.get("write_file") is None
+    assert registry.get("run_command") is None
 

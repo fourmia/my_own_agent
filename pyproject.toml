@@ -8,9 +8,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+openai = [
+    "openai>=2.0,<3",
+]
 dev = [
+    "openai>=2.0,<3",
     "pytest>=8.0.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live: opt-in tests that call a real external Provider",
+]

@@ -1,6 +1,6 @@
 # Iteration 3：真实 LLM 与原生 Tool Calling 设计
 
-- 状态：3A Implemented，3B Proposed
+- 状态：3A/3B Implemented，3C Proposed
 - 日期：2026-07-16
 - 首个 Provider：OpenAI Responses API
 - 核心原则：领域协议归 Runtime 所有，SDK 类型限制在 Adapter 内部
@@ -378,12 +378,12 @@ Responses API 可以使用 Provider 侧连续状态，也可以由客户端重�
 - [x] 验证 call_id；
 - [x] 重构现有 MockLLM。
 
-### Iteration 3B：OpenAI 非流式 Adapter
+### Iteration 3B：OpenAI 非流式 Adapter（已完成）
 
-- 引入官方 SDK 可选依赖；
-- 实现 Tool/Message/Response Mapper；
-- 增加 Provider 错误映射；
-- 增加可选 live smoke test。
+- [x] 引入官方 SDK 可选依赖；
+- [x] 实现 Tool/Message/Response Mapper；
+- [x] 增加 Provider 错误映射；
+- [x] 增加可选 live smoke test。
 
 ### Iteration 3C：流式事件
 

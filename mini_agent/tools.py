@@ -95,6 +95,18 @@ class ToolRegistry:
         return [tool.definition() for tool in self._tools.values()]
 
     def run(self, call: ToolCall) -> ToolResult:
+        # Provider 参数 JSON 解析失败时不执行 handler，但必须保留原 call_id，
+        # 让模型下一轮可以纠正同一个函数调用的参数。
+        if call.argument_error is not None:
+            return ToolResult(
+                call_id=call.call_id,
+                name=call.name,
+                ok=False,
+                content=f"Invalid JSON arguments for {call.name}: {call.argument_error}",
+                error_code="invalid_arguments",
+                details={"raw_arguments": call.raw_arguments or ""},
+            )
+
         # 只允许调用已注册工具。模型编造出的工具名会被当成一次失败 observation。
         tool = self.get(call.name)
         if tool is None:
@@ -423,4 +435,21 @@ def create_default_registry(root: Path) -> ToolRegistry:
             fn=get_file_stats,
         )
     )
+    return registry
+
+
+def create_read_only_registry(root: Path) -> ToolRegistry:
+    """为尚未接入权限审批的真实 Provider 创建只读工具集。
+
+    handler 和 Schema 仍来自同一个默认注册表，避免安全配置复制出两套工具定义。
+    Iteration 5 引入 Permission Policy 后，再由策略层决定何时开放写文件和 Shell。
+    """
+
+    all_tools = create_default_registry(root)
+    registry = ToolRegistry(root)
+    for name in ("list_files", "read_file", "search_files", "get_file_stats"):
+        tool = all_tools.get(name)
+        if tool is None:  # 防御性检查：默认工具重命名时应在启动阶段失败。
+            raise RuntimeError(f"missing built-in read-only tool: {name}")
+        registry.register(tool)
     return registry

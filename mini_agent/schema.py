@@ -43,12 +43,19 @@ class ToolCall:
     call_id: str
     name: str
     arguments: dict[str, Any]
+    # Provider 通常把函数参数作为 JSON 字符串返回。保留原文便于审计，
+    # argument_error 则让解析失败安全地转成关联的 invalid_arguments 结果。
+    raw_arguments: str | None
+    argument_error: str | None
 
     def __init__(
         self,
         call_id: str | None = None,
         name: str | dict[str, Any] | None = None,
         arguments: dict[str, Any] | None = None,
+        *,
+        raw_arguments: str | None = None,
+        argument_error: str | None = None,
     ) -> None:
         # 兼容旧的 ToolCall(name, arguments) 和 ToolCall(name=..., arguments=...)。
         # 旧调用没有 Provider call_id，只能生成稳定但不适合多调用的过渡 ID。
@@ -70,6 +77,8 @@ class ToolCall:
         object.__setattr__(self, "call_id", call_id)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "arguments", arguments)
+        object.__setattr__(self, "raw_arguments", raw_arguments)
+        object.__setattr__(self, "argument_error", argument_error)
 
 
 @dataclass(frozen=True)

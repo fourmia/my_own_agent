@@ -58,6 +58,8 @@ class LLM(ABC):
                     call_id=f"compat-call-{next_number + offset:04d}",
                     name=call.name,
                     arguments=call.arguments,
+                    raw_arguments=call.raw_arguments,
+                    argument_error=call.argument_error,
                 )
                 changed = True
             normalized.append(call)
