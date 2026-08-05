@@ -64,6 +64,9 @@ def test_agent_executes_multiple_calls_in_provider_order(tmp_path: Path) -> None
         "search_files",
         "run_command",
         "get_file_stats",
+        "apply_patch",
+        "git_diff",
+        "run_tests",
     ]
     assert all(not hasattr(tool, "fn") for tool in provider.requests[0].tools)
     assert [message.tool_call_id for message in provider.requests[1].messages[-2:]] == [

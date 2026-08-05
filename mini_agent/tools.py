@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 
@@ -16,6 +18,8 @@ from mini_agent.schema import ToolCall, ToolDefinition, ToolResult
 # 输入：模型给出的结构化参数
 # 输出：可放回上下文的字符串 observation
 ToolFn = Callable[[dict[str, Any]], str]
+ToolPermission = Literal["read", "write", "execute"]
+ToolEffect = Literal["none", "workspace_mutation", "diff_check", "test_check"]
 
 
 class WorkspacePathError(ValueError):
@@ -49,6 +53,9 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     fn: ToolFn
+    # permission 决定调用是否允许或需要审批；effect 驱动完成前验证守卫。
+    permission: ToolPermission = "read"
+    effect: ToolEffect = "none"
 
     def definition(self) -> ToolDefinition:
         """返回不包含本地 handler 的模型可见工具定义。"""
@@ -253,7 +260,8 @@ def create_default_registry(root: Path) -> ToolRegistry:
         return path.read_text(encoding="utf-8")
 
     def write_file(args: dict[str, Any]) -> str:
-        # 写文件是高风险工具。现在为了学习先开放，后面会引入 permission mode。
+        # 整文件覆盖仅保留在教学用默认工具集，并标记为 write 权限。
+        # 真实 coding registry 不注册它，避免模型绕过哈希前置条件覆盖并发修改。
         path = registry.resolve_workspace_path(str(args["path"]))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(args["content"]), encoding="utf-8")
@@ -279,8 +287,8 @@ def create_default_registry(root: Path) -> ToolRegistry:
         return "\n".join(matches[:50]) if matches else "(no matches)"
 
     def run_command(args: dict[str, Any]) -> str:
-        # shell 工具能力很强，也最危险。这里加了 timeout，并且固定在 workspace root 执行。
-        # 后面学习权限系统时，我们会把 run_command 放到需要审批的工具类别里。
+        # 任意 Shell 仅保留在教学用默认工具集，并标记为 execute 权限。
+        # 真实 coding registry 只开放参数受限的 run_tests，不暴露此 handler。
         command = str(args["command"])
         completed = subprocess.run(
             command,
@@ -291,15 +299,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
             timeout=10,
             check=False,
         )
-        # 把 stdout/stderr/exit code 都返回给模型。exit code 对调试测试失败尤其重要。
-        output = completed.stdout.strip()
-        error = completed.stderr.strip()
-        parts = [f"exit_code={completed.returncode}"]
-        if output:
-            parts.append(f"stdout:\n{output}")
-        if error:
-            parts.append(f"stderr:\n{error}")
-        result = "\n".join(parts)
+        result = format_process_result(completed)
         if completed.returncode != 0:
             # subprocess.run(check=False) 让我们能保留 stdout/stderr，再用领域错误表达失败。
             raise ToolExecutionFailure(
@@ -309,20 +309,151 @@ def create_default_registry(root: Path) -> ToolRegistry:
             )
         return result
 
+    def format_process_result(completed: subprocess.CompletedProcess[str]) -> str:
+        # 把 stdout/stderr/exit code 都返回给模型。exit code 对调试测试失败尤其重要。
+        output = completed.stdout.strip()
+        error = completed.stderr.strip()
+        parts = [f"exit_code={completed.returncode}"]
+        if output:
+            parts.append(f"stdout:\n{output}")
+        if error:
+            parts.append(f"stderr:\n{error}")
+        result = "\n".join(parts)
+        if len(result) > 20_000:
+            return result[:20_000] + "\n... output truncated ..."
+        return result
+
     def get_file_stats(args: dict[str, Any]) -> str:
         # 复用路径沙箱，统计工具也不能通过 ../ 或绝对路径逃出工作区。
         path = registry.resolve_workspace_path(str(args["path"]))
-        text = path.read_text(encoding="utf-8")
+        data = path.read_bytes()
+        text = data.decode("utf-8")
         return json.dumps(
             {
                 "path": str(path.relative_to(registry.root)),
                 # bytes 来自磁盘，characters/lines 来自 UTF-8 解码后的文本；CRLF 下两者可能不同。
-                "bytes": path.stat().st_size,
+                "bytes": len(data),
                 "lines": len(text.splitlines()),
                 "characters": len(text),
+                "sha256": hashlib.sha256(data).hexdigest(),
             },
             ensure_ascii=False,
         )
+
+    def apply_patch(args: dict[str, Any]) -> str:
+        """以哈希和唯一文本匹配为前置条件执行一次局部替换。"""
+
+        path = registry.resolve_workspace_path(str(args["path"]))
+        data = path.read_bytes()
+        before_hash = hashlib.sha256(data).hexdigest()
+        expected_hash = str(args["expected_sha256"]).lower()
+        if before_hash != expected_hash:
+            raise ToolExecutionFailure(
+                "stale_file",
+                "File changed after it was inspected; refresh content and hash.",
+                details={
+                    "path": str(path.relative_to(registry.root)),
+                    "expected_sha256": expected_hash,
+                    "actual_sha256": before_hash,
+                },
+            )
+
+        text = data.decode("utf-8")
+        old_text = str(args["old_text"])
+        new_text = str(args["new_text"])
+        occurrences = text.count(old_text)
+        if occurrences == 0:
+            raise ToolExecutionFailure(
+                "patch_conflict",
+                "The expected old_text was not found in the current file.",
+                details={"path": str(path.relative_to(registry.root))},
+            )
+        if occurrences > 1:
+            raise ToolExecutionFailure(
+                "ambiguous_patch",
+                "The expected old_text occurs more than once; provide more context.",
+                details={
+                    "path": str(path.relative_to(registry.root)),
+                    "occurrences": occurrences,
+                },
+            )
+        if old_text == new_text:
+            raise ToolExecutionFailure(
+                "patch_no_change",
+                "old_text and new_text are identical.",
+                details={"path": str(path.relative_to(registry.root))},
+            )
+
+        updated = text.replace(old_text, new_text, 1).encode("utf-8")
+        path.write_bytes(updated)
+        return json.dumps(
+            {
+                "path": str(path.relative_to(registry.root)),
+                "before_sha256": before_hash,
+                "after_sha256": hashlib.sha256(updated).hexdigest(),
+                "replacements": 1,
+            },
+            ensure_ascii=False,
+        )
+
+    def git_diff(_: dict[str, Any]) -> str:
+        completed = subprocess.run(
+            ["git", "diff", "--no-ext-diff", "--unified=3", "--"],
+            cwd=registry.root,
+            shell=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise ToolExecutionFailure(
+                "command_failed",
+                format_process_result(completed),
+                details={"exit_code": completed.returncode},
+            )
+        output = completed.stdout.strip()
+        if not output:
+            return "(no changes)"
+        return output[:20_000] + ("\n... diff truncated ..." if len(output) > 20_000 else "")
+
+    def run_tests(args: dict[str, Any]) -> str:
+        targets = [str(target) for target in args["targets"]]
+        for target in targets:
+            # 使用 argv + shell=False 已阻止 Shell 注入；同时禁止 pytest 选项注入，
+            # 并限制 node ID 的路径部分必须位于工作区内。
+            if target.startswith("-") or "\x00" in target:
+                raise ToolExecutionFailure(
+                    "invalid_test_target",
+                    f"Unsafe pytest target: {target!r}",
+                    details={"target": target},
+                )
+            target_path = target.split("::", 1)[0]
+            try:
+                registry.resolve_workspace_path(target_path)
+            except WorkspacePathError as exc:
+                raise ToolExecutionFailure(
+                    "invalid_test_target",
+                    f"Unsafe pytest target: {target!r}",
+                    details={"target": target, "reason": str(exc)},
+                ) from exc
+        completed = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", *targets],
+            cwd=registry.root,
+            shell=False,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        result = format_process_result(completed)
+        if completed.returncode != 0:
+            raise ToolExecutionFailure(
+                "command_failed",
+                result,
+                details={"exit_code": completed.returncode, "targets": targets},
+            )
+        return result
 
     registry.register(
         Tool(
@@ -376,6 +507,8 @@ def create_default_registry(root: Path) -> ToolRegistry:
                 "additionalProperties": False,
             },
             fn=write_file,
+            permission="write",
+            effect="workspace_mutation",
         )
     )
     registry.register(
@@ -414,6 +547,7 @@ def create_default_registry(root: Path) -> ToolRegistry:
                 "additionalProperties": False,
             },
             fn=run_command,
+            permission="execute",
         )
     )
     registry.register(
@@ -435,14 +569,90 @@ def create_default_registry(root: Path) -> ToolRegistry:
             fn=get_file_stats,
         )
     )
+    registry.register(
+        Tool(
+            name="apply_patch",
+            description=(
+                "Replace one exact, unique text block in an existing UTF-8 file. "
+                "Call get_file_stats first and pass its sha256 as expected_sha256."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Workspace-relative existing file path.",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Exact unique text currently present in the file.",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text.",
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-fA-F]{64}$",
+                        "description": "SHA-256 returned by get_file_stats.",
+                    },
+                },
+                "required": ["path", "old_text", "new_text", "expected_sha256"],
+                "additionalProperties": False,
+            },
+            fn=apply_patch,
+            permission="write",
+            effect="workspace_mutation",
+        )
+    )
+    registry.register(
+        Tool(
+            name="git_diff",
+            description="Inspect the current workspace git diff without modifying files.",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            fn=git_diff,
+            effect="diff_check",
+        )
+    )
+    registry.register(
+        Tool(
+            name="run_tests",
+            description=(
+                "Run pytest with safe argv handling. Use an empty targets array for "
+                "the full suite or provide test paths/node IDs."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "maxItems": 20,
+                        "description": "Pytest paths or node IDs; options are forbidden.",
+                    }
+                },
+                "required": ["targets"],
+                "additionalProperties": False,
+            },
+            fn=run_tests,
+            permission="execute",
+            effect="test_check",
+        )
+    )
     return registry
 
 
 def create_read_only_registry(root: Path) -> ToolRegistry:
-    """为尚未接入权限审批的真实 Provider 创建只读工具集。
+    """创建物理上不包含任何副作用 handler 的最小只读工具集。
 
-    handler 和 Schema 仍来自同一个默认注册表，避免安全配置复制出两套工具定义。
-    Iteration 5 引入 Permission Policy 后，再由策略层决定何时开放写文件和 Shell。
+    它与 ReadOnlyPermissionPolicy 的用途不同：Policy 可以拒绝已注册工具，而本函数
+    让高风险工具根本不会进入模型 schema，适合能力必须最小化的宿主环境。
     """
 
     all_tools = create_default_registry(root)
@@ -451,5 +661,27 @@ def create_read_only_registry(root: Path) -> ToolRegistry:
         tool = all_tools.get(name)
         if tool is None:  # 防御性检查：默认工具重命名时应在启动阶段失败。
             raise RuntimeError(f"missing built-in read-only tool: {name}")
+        registry.register(tool)
+    return registry
+
+
+def create_coding_registry(root: Path) -> ToolRegistry:
+    """真实 coding Provider 使用的受控工具集，不暴露整文件写入或任意 Shell。"""
+
+    all_tools = create_default_registry(root)
+    registry = ToolRegistry(root)
+    names = (
+        "list_files",
+        "read_file",
+        "search_files",
+        "get_file_stats",
+        "apply_patch",
+        "git_diff",
+        "run_tests",
+    )
+    for name in names:
+        tool = all_tools.get(name)
+        if tool is None:
+            raise RuntimeError(f"missing built-in coding tool: {name}")
         registry.register(tool)
     return registry

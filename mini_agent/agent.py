@@ -3,8 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mini_agent.llm import LLM
-from mini_agent.schema import Message, ModelRequest
-from mini_agent.tools import ToolRegistry
+from mini_agent.permissions import (
+    ApprovalHandler,
+    DenyApprovalHandler,
+    PermissionPolicy,
+    ReadOnlyPermissionPolicy,
+)
+from mini_agent.provider_errors import ProviderError
+from mini_agent.retry import ProviderRetryPolicy
+from mini_agent.schema import Message, ModelRequest, ToolCall, ToolResult
+from mini_agent.tools import Tool, ToolRegistry
+from mini_agent.verification import VerificationState
 
 
 @dataclass(frozen=True)
@@ -28,11 +37,27 @@ class Agent:
     在尚未引入并发、审批和写冲突策略前，先固定可回放的协议语义。
     """
 
-    def __init__(self, llm: LLM, tools: ToolRegistry, max_steps: int = 6) -> None:
+    def __init__(
+        self,
+        llm: LLM,
+        tools: ToolRegistry,
+        max_steps: int = 6,
+        *,
+        permission_policy: PermissionPolicy | None = None,
+        approval_handler: ApprovalHandler | None = None,
+        retry_policy: ProviderRetryPolicy | None = None,
+        require_verification: bool = True,
+        system_prompt: str | None = None,
+    ) -> None:
         # 依赖注入：Agent 不关心具体模型是哪家，也不关心工具怎么实现。
         # 这让我们可以先用 MockLLM 学习，之后再替换成真实 Provider Adapter。
         self.llm = llm
         self.tools = tools
+        self.permission_policy = permission_policy or ReadOnlyPermissionPolicy()
+        self.approval_handler = approval_handler or DenyApprovalHandler()
+        self.retry_policy = retry_policy or ProviderRetryPolicy()
+        self.require_verification = require_verification
+        self.system_prompt = system_prompt
 
         # max_steps 是安全阀。真实模型可能误判、循环调用工具，甚至被 prompt injection 带偏。
         # 没有步数上限，Agent 可能无限运行、疯狂烧钱或不断修改文件。
@@ -40,8 +65,12 @@ class Agent:
 
     def run(self, task: str, trace: bool = True) -> AgentResult:
         # 对话历史从用户任务开始。后面每一轮 assistant/tool 消息都会追加进来。
-        messages = [Message("user", task)]
+        messages: list[Message] = []
+        if self.system_prompt:
+            messages.append(Message("system", self.system_prompt))
+        messages.append(Message("user", task))
         seen_call_ids: set[str] = set()
+        verification = VerificationState()
 
         for step in range(1, self.max_steps + 1):
             # 只把 ToolDefinition 交给模型，避免 Provider 看到本地 Python handler。
@@ -51,7 +80,18 @@ class Agent:
                 messages=list(messages),
                 tools=self.tools.list_definitions(),
             )
-            response = self.llm.generate(request)
+            response = self.retry_policy.generate(
+                self.llm,
+                request,
+                on_retry=(
+                    lambda attempt, delay, error: self._trace_retry(
+                        attempt,
+                        delay,
+                        error,
+                        trace=trace,
+                    )
+                ),
+            )
 
             # assistant 消息必须持久化整批结构化调用。后续模型需要知道每个
             # observation 对应哪个 call_id 和原始参数，而不能依赖打印日志猜测。
@@ -70,6 +110,18 @@ class Agent:
             # 没有工具调用代表模型给出了最终文本、拒绝或不完整结果；这些状态都
             # 需要交给上层展示，不能因为没有工具就继续盲目循环。
             if not response.tool_calls:
+                missing = verification.missing_requirements()
+                if (
+                    self.require_verification
+                    and response.finish_reason == "completed"
+                    and missing
+                ):
+                    blocked = verification.blocking_message()
+                    messages.append(Message("system", blocked))
+                    if trace:
+                        print(f"\n[step {step}] completion_blocked")
+                        print(blocked)
+                    continue
                 return AgentResult(response.content, step, messages)
 
             # 逐个执行同一 ModelTurn 中的调用。一个工具失败不阻止同批次后续调用；
@@ -86,8 +138,11 @@ class Agent:
                         f"{call.name}({call.arguments})"
                     )
 
-                # 工具执行结果先进入模型上下文，不直接返回给用户。
-                result = self.tools.run(call)
+                # 权限检查发生在 handler 之前。deny/未批准 ask 会生成普通 ToolResult，
+                # 模型可以看到拒绝原因，但任何文件或进程副作用都不会发生。
+                tool = self.tools.get(call.name)
+                result = self._execute_call(call, tool)
+                verification.observe(tool, result)
                 observation = result.to_observation()
                 messages.append(
                     Message(
@@ -106,3 +161,40 @@ class Agent:
         final = f"Stopped after reaching max_steps={self.max_steps}."
         messages.append(Message("assistant", final))
         return AgentResult(final, self.max_steps, messages)
+
+    def _execute_call(self, call: ToolCall, tool: Tool | None) -> ToolResult:
+        if tool is None:
+            return self.tools.run(call)
+
+        decision = self.permission_policy.evaluate(tool, call)
+        if decision.outcome == "deny":
+            return self._permission_denied(call, decision.reason)
+        if decision.outcome == "ask" and not self.approval_handler.approve(tool, call):
+            return self._permission_denied(call, "approval was not granted")
+        return self.tools.run(call)
+
+    @staticmethod
+    def _permission_denied(call: ToolCall, reason: str) -> ToolResult:
+        return ToolResult(
+            call_id=call.call_id,
+            name=call.name,
+            ok=False,
+            content=f"Permission denied for {call.name}: {reason}",
+            error_code="permission_denied",
+            details={"reason": reason},
+        )
+
+    @staticmethod
+    def _trace_retry(
+        attempt: int,
+        delay: float,
+        error: ProviderError,
+        *,
+        trace: bool,
+    ) -> None:
+        if not trace:
+            return
+        print(
+            f"\n[provider retry] attempt={attempt} delay={delay:.2f}s "
+            f"code={error.code}"
+        )
