@@ -261,6 +261,9 @@ def _make_interrupted_run(
         llm_identity="fake.provider",
         tool_schema_sha256=tool_schema_fingerprint(registry.list_tools()),
         workspace=workspace_identity(tmp_path),
+        permission_policy_identity=(
+            "mini_agent.permissions.ReadOnlyPermissionPolicy"
+        ),
     )
     ref = artifact_store.save(snapshot)
     event_store.append(
@@ -307,6 +310,9 @@ def test_resume_analyzer_allows_clean_interrupted_run_without_provider_call(
             snapshot_store,
             registry,
             llm_identity="fake.provider",
+            permission_policy_identity=(
+                "mini_agent.permissions.ReadOnlyPermissionPolicy"
+            ),
         )
         result = analyzer.analyze(run_id)
     finally:
@@ -330,6 +336,9 @@ def test_resume_analyzer_blocks_started_write_as_manual_reconciliation(
             snapshot_store,
             create_default_registry(tmp_path),
             llm_identity="fake.provider",
+            permission_policy_identity=(
+                "mini_agent.permissions.ReadOnlyPermissionPolicy"
+            ),
         ).analyze(run_id)
     finally:
         event_store.close()
@@ -348,6 +357,9 @@ def test_resume_analyzer_reports_completed_run_and_schema_change(
             snapshot_store,
             create_default_registry(tmp_path),
             llm_identity="fake.provider",
+            permission_policy_identity=(
+                "mini_agent.permissions.ReadOnlyPermissionPolicy"
+            ),
         ).analyze(run_id)
         assert completed.decision == "already_completed"
 
@@ -369,6 +381,9 @@ def test_resume_analyzer_reports_completed_run_and_schema_change(
             snapshot_store,
             registry,
             llm_identity="fake.provider",
+            permission_policy_identity=(
+                "mini_agent.permissions.ReadOnlyPermissionPolicy"
+            ),
         ).analyze(run_id)
     finally:
         event_store.close()
@@ -399,6 +414,9 @@ def test_resume_analyzer_blocks_schema_change_for_interrupted_run(
             snapshot_store,
             registry,
             llm_identity="fake.provider",
+            permission_policy_identity=(
+                "mini_agent.permissions.ReadOnlyPermissionPolicy"
+            ),
         ).analyze(run_id)
     finally:
         event_store.close()

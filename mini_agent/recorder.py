@@ -34,6 +34,18 @@ class RunRecorder:
     def current_sequence(self, run_id: str) -> int:
         return self._last_sequences.get(run_id, 0)
 
+    def claim_resume(
+        self,
+        run_id: str,
+        expected_sequence: int,
+        payload: dict[str, Any],
+    ) -> int:
+        if self.event_store is None:
+            raise RuntimeError("resume requires an EventStore")
+        event = self.event_store.claim_resume(run_id, expected_sequence, payload)
+        self._last_sequences[run_id] = event.sequence
+        return event.sequence
+
     def save_snapshot(self, snapshot: RunSnapshot) -> ArtifactRef | None:
         if self.snapshot_store is None:
             return None

@@ -8,7 +8,7 @@
 用户目标 -> 模型思考 -> 选择工具 -> 执行工具 -> 观察结果 -> 继续决策 -> 完成
 ```
 
-## 当前阶段：Stage 1 / Iteration 5B1
+## 当前阶段：Stage 1 / Iteration 5B2
 
 项目现在已经形成最小可审计执行闭环：同时支持零配置 `MockLLM` 和 OpenAI Responses 非流式 Adapter，Runtime 支持 Provider 重试、工具权限审批、基于文件哈希的局部修改、修改后的完成守卫、SQLite append-only Execution Journal，以及内容寻址 Artifact Store 和版本化 Run Snapshot。OpenAI SDK 类型仍被限制在 Provider 模块内，默认测试不访问网络也不需要 API key。
 
@@ -39,7 +39,14 @@ python -m mini_agent --analyze-resume RUN_ID
 python -m mini_agent --provider openai --model MODEL_ID --analyze-resume RUN_ID
 ```
 
-分析命令不会请求模型或执行工具。必须使用原运行相同的 Provider、模型和工具集；5B1 尚不会从旧快照自动选择运行配置，也尚未实现 `resume-run`。
+分析命令不会请求模型或执行工具。5B2 允许显式恢复分析通过的运行：
+
+```powershell
+python -m mini_agent --resume-run RUN_ID --approval-mode full
+python -m mini_agent --provider openai --model MODEL_ID --approval-mode on-request --resume-run RUN_ID
+```
+
+必须使用原运行相同的 Provider、模型、审批模式和工具集。只允许 `model_request` 或只读 `tool_batch` 恢复；未知 write、execute、mutation 副作用仍然阻断。CLI 尚不会从旧快照自动选择运行配置。
 
 如果你是第一次学习 Agent，请先阅读：
 
@@ -77,7 +84,7 @@ python -m mini_agent "修复失败测试" --provider openai --model MODEL_ID --a
 - `mini_agent/artifacts.py`：内容寻址 Artifact Store 和完整性校验
 - `mini_agent/snapshots.py`：版本化运行快照、工具与工作区指纹
 - `mini_agent/recorder.py`：Journal 与 Snapshot 的统一写入顺序
-- `mini_agent/resume.py`：无模型、无工具副作用的恢复分析器
+- `mini_agent/resume.py`：恢复分析器和受限恢复执行器
 - `mini_agent/tools.py`：工具注册、参数校验、工具执行
 - `mini_agent/schema.py`：消息、工具调用、工具结果、模型请求和模型轮次
 
@@ -92,6 +99,7 @@ python -m mini_agent "修复失败测试" --provider openai --model MODEL_ID --a
 - `docs/iteration-4-safe-execution.md`：重试边界、权限审批、受控 Patch 和完成验证
 - `docs/iteration-5a-execution-journal.md`：append-only Journal、事件顺序与恢复风险分类
 - `docs/iteration-5b1-recovery-foundation.md`：Artifact、Snapshot、恢复指纹和只读分析决策
+- `docs/iteration-5b2-safe-resume-execution.md`：原子恢复 claim、状态重建和只读恢复边界
 - `docs/iteration-3-real-llm-design.md`：真实 LLM Adapter、调用关联和多工具协议设计
 - `docs/adr/0001-own-runtime-use-provider-adapters.md`：自研 Runtime、按边界复用开源方案的架构决策
 
@@ -105,5 +113,5 @@ python -m mini_agent "修复失败测试" --provider openai --model MODEL_ID --a
 6. 运行测试，重点观察拒绝审批、陈旧哈希和完成阻断三个失败路径。
 7. 执行一个 CLI 任务，再用输出的 `run_id` 检查完整事件时间线。
 
-下一阶段是 Iteration 5B2：在 Snapshot、Artifact Store 和 `--analyze-resume` 基础上，增加只读范围内的显式 `resume-run` 状态机。started-only 的写入或执行工具必须先检查实际状态或人工确认，不能自动重放。
+下一阶段是 Iteration 5B3：为未知副作用增加显式 reconciliation。优先从具有 before/after hash 的受控 Patch 开始；任意 Shell、外部 API 和数据库操作仍需工具级幂等键、状态查询或人工确认。
 

@@ -41,6 +41,8 @@ class RunSnapshot:
     llm_identity: str
     tool_schema_sha256: str
     workspace: WorkspaceIdentity
+    # 5B1 生成的 v1 Snapshot 没有该字段；它们可继续分析，但不能自动恢复。
+    permission_policy_identity: str | None = None
 
 
 class SnapshotStore(Protocol):
@@ -117,6 +119,7 @@ def snapshot_to_bytes(snapshot: RunSnapshot) -> bytes:
         "llm_identity": snapshot.llm_identity,
         "tool_schema_sha256": snapshot.tool_schema_sha256,
         "workspace": asdict(snapshot.workspace),
+        "permission_policy_identity": snapshot.permission_policy_identity,
     }
     return json.dumps(
         payload,
@@ -175,6 +178,11 @@ def snapshot_from_bytes(content: bytes) -> RunSnapshot:
             root=str(workspace["root"]),
             git_head=workspace.get("git_head"),
             state_sha256=str(workspace["state_sha256"]),
+        ),
+        permission_policy_identity=(
+            str(value["permission_policy_identity"])
+            if value.get("permission_policy_identity") is not None
+            else None
         ),
     )
 

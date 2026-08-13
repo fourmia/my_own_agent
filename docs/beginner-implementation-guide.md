@@ -2,7 +2,7 @@
 
 这是一份面向新手的主线教程。它不假设你已经理解 Agent、Tool Calling、Provider Adapter、权限策略或事件日志，只要求你能阅读基础 Python。
 
-本教程从项目最早的最小循环讲到当前 Iteration 5B1。读完后，你应该不仅知道“每个文件做什么”，还应该能解释：为什么必须按这个顺序迭代、每一层解决了什么失败模式，以及哪些设计会严重影响 Agent 的准确度。
+本教程从项目最早的最小循环讲到当前 Iteration 5B2。读完后，你应该不仅知道“每个文件做什么”，还应该能解释：为什么必须按这个顺序迭代、每一层解决了什么失败模式，以及哪些设计会严重影响 Agent 的准确度。
 
 > 本文讲的是当前代码的真实实现。早期专题文档保留了当时的演进过程，个别早期字段已经被后续版本升级；遇到差异时，以当前源码和本文为准。
 
@@ -1182,6 +1182,33 @@ python -m mini_agent --provider openai --model MODEL_ID --analyze-resume RUN_ID
 
 掌握标准：你能解释为什么 Snapshot 不能替代 Journal，以及为什么 `resume_allowed` 只是允许进入恢复状态机，不等于已经执行恢复。
 
+### 9.11 Iteration 5B2：受限恢复执行
+
+5B2 将 `resume_allowed` 接入显式执行入口，但没有扩大未知副作用的自动处理范围：
+
+```text
+ResumeAnalyzer 只读检查
+  -> EventStore 原子 claim_resume
+  -> Snapshot 重建 messages / call IDs / verification
+  -> model_request 继续，或只读 tool_batch 重新执行
+  -> 公共 Agent Loop
+```
+
+分析和执行之间必须原子抢占。否则两个进程可能同时分析成功并重复请求 Provider 或工具。SQLite EventStore 在同一事务中比较最后 sequence 并追加 `run_resumed`；只有第一个进程成功。
+
+恢复不会创建新 run ID，而是在原时间线上追加事件。`model_request` Snapshot 直接进入下一轮；`tool_batch` 只允许 read 且非 mutation 的工具，并重新经过 Permission Policy。Snapshot 后若已有 completed/skipped ToolResult，由于 Journal 只有摘要、无法重建完整 observation，因此必须阻断。
+
+运行：
+
+```powershell
+python -m mini_agent --resume-run RUN_ID --approval-mode full
+python -m mini_agent --provider openai --model MODEL_ID --approval-mode on-request --resume-run RUN_ID
+```
+
+Provider、模型、审批模式、工具 Schema、`max_steps`、验证策略和 workspace 都必须与 Snapshot 一致。旧 5B1 Snapshot 缺少 Permission Policy identity，可以审计但不能自动执行。
+
+对应测试：`tests/test_resume_execution.py`。掌握标准：你能解释为什么 `claim_resume` 必须发生在 Provider/Tool 之前，以及为什么 completed ToolResult 反而不能简单重跑。
+
 ## 10. 把当前完整执行链串起来
 
 下面是一项真实 coding 任务在当前架构中的完整路径：
@@ -1431,16 +1458,16 @@ python -m mini_agent --inspect-run RUN_ID
 
 当前项目已经比“能调用工具的 Demo”可靠很多，但还不是完整生产系统。
 
-### 15.1 Iteration 5B2：执行受限恢复
+### 15.1 Iteration 5B3：未知副作用协调
 
-5B1 已实现 Message Snapshot、内容寻址 Artifact Store、工作区与 Git identity 和只读恢复分析。下一步需要实现：
+5B1 已实现恢复数据和只读分析，5B2 已实现只读范围的显式恢复。下一步需要实现：
 
-- `resume-run` 显式状态机；
-- completed ToolCall 结果复用；
-- started-only read 工具的受控重试；
-- 恢复前权限重新确认。
+- Patch before/after hash 状态检查；
+- “确定未执行 / 确定已执行 / 无法判断”协调结果；
+- 人工或策略显式确认接口；
+- 工具级幂等键与外部状态查询合同。
 
-write、execute、mutation 的 unknown outcome 协调仍应保持独立边界，不能在 5B2 中自动重放。
+write、execute、mutation 不能因为有 Snapshot 就自动重放。任意 Shell 和外部系统副作用尤其需要保守处理。
 
 ### 15.2 真正进程沙箱
 
@@ -1503,6 +1530,7 @@ Streaming 应被设计为传输事件，最终仍组装成同一个 `ModelTurn` 
 - `iteration-4-safe-execution.md`：权限、受控 Patch 和验证守卫；
 - `iteration-5a-execution-journal.md`：事件 Schema、事务和恢复风险；
 - `iteration-5b1-recovery-foundation.md`：Artifact、Snapshot、指纹和恢复分析；
+- `iteration-5b2-safe-resume-execution.md`：原子 claim 和受限恢复状态机；
 - `adr/0001-own-runtime-use-provider-adapters.md`：为什么自研 Runtime，并通过 Adapter 复用 Provider SDK。
 
 建议不要只读文档。每读完一个阶段，运行对应测试，并尝试预测消息、调用和事件的准确顺序。Agent 工程真正需要掌握的不是某个框架 API，而是这些跨模型、工具和持久化边界仍然成立的协议。

@@ -178,8 +178,8 @@ python -m pytest -q
 
 测试覆盖 Artifact 去重/损坏、Snapshot 序列化、Agent 快照保存、恢复决策、Schema 变化阻断和分析器无副作用。
 
-## 10. 下一步 5B2
+## 10. 后续 5B2 与 5B3
 
-5B2 才实现极小范围的 `resume-run`：只恢复 `resume_allowed`，复用 Snapshot 中已有消息和已完成 ToolResult，started-only read 经过重新权限判断后才允许执行；write、execute、mutation 仍然阻断。
+5B2 已在 [`iteration-5b2-safe-resume-execution.md`](iteration-5b2-safe-resume-execution.md) 中实现极小范围的 `resume-run`：只恢复 `resume_allowed`，复用 Snapshot 中已有消息和已完成 ToolResult，started-only read 经过重新权限判断后才允许执行；write、execute、mutation 仍然阻断。
 
-任意 Patch、Shell 或测试的未知结果协调属于后续专门迭代，不能因为有 Snapshot 就默认安全。
+后续 5B3 才处理任意 Patch、Shell、测试和外部系统的未知结果协调，不能因为有 Snapshot 就默认安全。

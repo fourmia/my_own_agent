@@ -22,7 +22,7 @@ from mini_agent.permissions import (
 from mini_agent.provider_errors import ProviderError
 from mini_agent.providers import OpenAIResponsesAdapter
 from mini_agent.retry import ProviderRetryPolicy
-from mini_agent.resume import ResumeAnalyzer
+from mini_agent.resume import ResumeAnalyzer, ResumeExecutor, ResumeRejectedError
 from mini_agent.snapshots import ArtifactSnapshotStore
 from mini_agent.tools import create_coding_registry, create_default_registry
 
@@ -116,6 +116,11 @@ def main() -> None:
         metavar="RUN_ID",
         help="Analyze resumability without calling a Provider or executing tools.",
     )
+    parser.add_argument(
+        "--resume-run",
+        metavar="RUN_ID",
+        help="Resume a run only after conservative recovery checks pass.",
+    )
     parser.add_argument("--no-trace", action="store_true", help="Only print final answer.")
     args = parser.parse_args()
 
@@ -125,14 +130,21 @@ def main() -> None:
         journal_path = root / journal_path
     artifacts_path = journal_path.parent / "artifacts"
 
-    if args.inspect_run or args.analyze_resume:
-        if args.inspect_run and args.analyze_resume:
-            parser.error("--inspect-run and --analyze-resume cannot be combined")
+    inspection_options = [
+        option
+        for option in (args.inspect_run, args.analyze_resume, args.resume_run)
+        if option is not None
+    ]
+    if inspection_options:
+        if len(inspection_options) > 1:
+            parser.error(
+                "--inspect-run, --analyze-resume and --resume-run are mutually exclusive"
+            )
         if args.task is not None:
             parser.error("task cannot be combined with inspection options")
         try:
             with SQLiteEventStore(journal_path) as event_store:
-                target_run = args.inspect_run or args.analyze_resume
+                target_run = args.inspect_run or args.analyze_resume or args.resume_run
                 if args.analyze_resume:
                     if args.provider == "openai" and not args.model:
                         parser.error(
@@ -142,6 +154,10 @@ def main() -> None:
                         create_default_registry(root)
                         if args.provider == "mock"
                         else create_coding_registry(root)
+                    )
+                    permission_policy, _ = create_permission_policy(
+                        args.provider,
+                        args.approval_mode,
                     )
                     llm_identity = (
                         "mini_agent.llm.MockLLM"
@@ -155,6 +171,12 @@ def main() -> None:
                         ),
                         tools,
                         llm_identity=llm_identity,
+                        permission_policy_identity=(
+                            f"{type(permission_policy).__module__}."
+                            f"{type(permission_policy).__qualname__}"
+                        ),
+                        max_steps=6,
+                        require_verification=True,
                     )
                     print(
                         json.dumps(
@@ -164,7 +186,56 @@ def main() -> None:
                         )
                     )
                     return
+                if args.resume_run:
+                    llm = create_llm(args, parser)
+                    tools = (
+                        create_default_registry(root)
+                        if args.provider == "mock"
+                        else create_coding_registry(root)
+                    )
+                    permission_policy, approval_handler = create_permission_policy(
+                        args.provider,
+                        args.approval_mode,
+                    )
+                    agent = Agent(
+                        llm=llm,
+                        tools=tools,
+                        permission_policy=permission_policy,
+                        approval_handler=approval_handler,
+                        retry_policy=ProviderRetryPolicy(
+                            max_attempts=args.max_provider_attempts,
+                        ),
+                        system_prompt=(
+                            CODING_SYSTEM_PROMPT if args.provider == "openai" else None
+                        ),
+                        event_store=event_store,
+                        snapshot_store=ArtifactSnapshotStore(
+                            FileArtifactStore(artifacts_path)
+                        ),
+                    )
+                    try:
+                        result = ResumeExecutor(agent).run(
+                            target_run,
+                            trace=not args.no_trace,
+                        )
+                    except ResumeRejectedError as error:
+                        print(
+                            json.dumps(
+                                asdict(error.analysis),
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        )
+                        parser.exit(2, "resume rejected\n")
+                    print(f"\n[run_id]\n{result.run_id}")
+                    print("\n[final]")
+                    print(result.answer)
+                    return
                 events = event_store.load(target_run)
+        except ProviderError as error:
+            parser.exit(1, f"provider error [{error.code}]: {error}\n")
+        except RuntimeError as error:
+            parser.exit(1, f"resume runtime error: {error}\n")
         except (sqlite3.Error, ValueError) as error:
             parser.exit(1, f"journal error: {error}\n")
         if not events:
@@ -182,7 +253,7 @@ def main() -> None:
         return
 
     if args.task is None:
-        parser.error("task is required unless --inspect-run is used")
+        parser.error("task is required unless an inspection or resume option is used")
 
     try:
         llm = create_llm(args, parser)

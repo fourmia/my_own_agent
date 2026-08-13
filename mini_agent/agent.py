@@ -22,11 +22,11 @@ from mini_agent.provider_errors import ProviderError
 from mini_agent.retry import ProviderRetryPolicy
 from mini_agent.schema import Message, ModelRequest, ToolCall, ToolResult
 from mini_agent.snapshots import (
-    ArtifactSnapshotStore,
-    SnapshotStore,
     RunSnapshot,
     SNAPSHOT_SCHEMA_VERSION,
+    SnapshotStore,
     tool_schema_fingerprint,
+    verification_from_snapshot,
     workspace_identity,
 )
 from mini_agent.tools import Tool, ToolRegistry
@@ -132,8 +132,155 @@ class Agent:
             next_step=1,
             resume_point="model_request",
         )
+        return self._continue_loop(
+            messages,
+            seen_call_ids,
+            verification,
+            start_step=1,
+            trace=trace,
+            run_id=run_id,
+        )
 
-        for step in range(1, self.max_steps + 1):
+    def _resume_from_snapshot(
+        self,
+        snapshot: RunSnapshot,
+        *,
+        expected_journal_sequence: int,
+        trace: bool,
+    ) -> AgentResult:
+        """仅供 ResumeExecutor 调用；在原子 claim 后恢复已验证状态。"""
+
+        if snapshot.max_steps != self.max_steps:
+            raise ValueError("Agent max_steps does not match the persisted run")
+        if snapshot.require_verification != self.require_verification:
+            raise ValueError("Agent verification policy does not match the persisted run")
+        if snapshot.resume_point == "run_completion":
+            raise ValueError("an incomplete completion commit cannot be resumed")
+
+        self.recorder.claim_resume(
+            snapshot.run_id,
+            expected_journal_sequence,
+            {
+                "from_snapshot_sequence": snapshot.last_event_sequence,
+                "previous_journal_sequence": expected_journal_sequence,
+                "resume_point": snapshot.resume_point,
+                "next_step": snapshot.next_step,
+            },
+        )
+        try:
+            self._validate_claimed_snapshot(snapshot)
+            return self._continue_from_claimed_snapshot(snapshot, trace=trace)
+        except Exception as error:
+            try:
+                self._record(
+                    snapshot.run_id,
+                    "run_failed",
+                    {
+                        "exception_type": type(error).__name__,
+                        "provider_error_code": (
+                            error.code if isinstance(error, ProviderError) else None
+                        ),
+                    },
+                )
+            except Exception:  # noqa: BLE001 - preserve the resumed Runtime failure
+                pass
+            raise
+
+    def _validate_claimed_snapshot(self, snapshot: RunSnapshot) -> None:
+        """在 claim 后再次检查易变化的本地身份，缩短竞态窗口。"""
+
+        if snapshot.llm_identity != self.llm_identity():
+            raise RuntimeError("LLM identity changed after resume claim")
+        if snapshot.permission_policy_identity != self.permission_policy_identity():
+            raise RuntimeError("permission policy changed after resume claim")
+        if snapshot.tool_schema_sha256 != tool_schema_fingerprint(
+            self.tools.list_tools()
+        ):
+            raise RuntimeError("tool schema changed after resume claim")
+        if snapshot.workspace != workspace_identity(self.tools.root):
+            raise RuntimeError("workspace identity changed after resume claim")
+
+    def _continue_from_claimed_snapshot(
+        self,
+        snapshot: RunSnapshot,
+        *,
+        trace: bool,
+    ) -> AgentResult:
+        """恢复 claim 成功后重建内存状态；失败由外层记录 run_failed。"""
+
+        messages = list(snapshot.messages)
+        seen_call_ids = set(snapshot.seen_call_ids)
+        verification = verification_from_snapshot(snapshot.verification)
+        start_step = snapshot.next_step
+
+        if snapshot.resume_point == "tool_batch":
+            pending_calls = messages[-1].tool_calls
+            for call in pending_calls:
+                if trace:
+                    print(
+                        f"\n[resumed tool_call {snapshot.next_step}] "
+                        f"{call.name}({call.arguments})"
+                    )
+                tool = self.tools.get(call.name)
+                if tool is None or tool.permission != "read" or (
+                    tool.effect == "workspace_mutation"
+                ):
+                    raise RuntimeError("unsafe tool batch passed resume analysis")
+                result = self._execute_call(call, tool, run_id=snapshot.run_id)
+                before_verification = verification.snapshot()
+                verification.observe(tool, result)
+                after_verification = verification.snapshot()
+                if after_verification != before_verification:
+                    self._record(
+                        snapshot.run_id,
+                        "verification_updated",
+                        {
+                            "call_id": call.call_id,
+                            "tool": call.name,
+                            "effect": tool.effect,
+                            "state": after_verification,
+                        },
+                    )
+                messages.append(
+                    Message(
+                        "tool",
+                        result.to_observation(),
+                        tool_call_id=result.call_id,
+                        tool_name=result.name,
+                    )
+                )
+            start_step += 1
+            self._save_snapshot(
+                snapshot.run_id,
+                messages,
+                seen_call_ids,
+                verification,
+                next_step=start_step,
+                resume_point="model_request",
+            )
+
+        return self._continue_loop(
+            messages,
+            seen_call_ids,
+            verification,
+            start_step=start_step,
+            trace=trace,
+            run_id=snapshot.run_id,
+        )
+
+    def _continue_loop(
+        self,
+        messages: list[Message],
+        seen_call_ids: set[str],
+        verification: VerificationState,
+        *,
+        start_step: int,
+        trace: bool,
+        run_id: str,
+    ) -> AgentResult:
+        """从一个已持久化的 model_request 边界继续公共 Agent Loop。"""
+
+        for step in range(start_step, self.max_steps + 1):
             # 只把 ToolDefinition 交给模型，避免 Provider 看到本地 Python handler。
             request = ModelRequest(
                 # 每一轮发送历史快照。若直接传入可变的 messages，后续追加的
@@ -141,7 +288,10 @@ class Agent:
                 messages=list(messages),
                 tools=self.tools.list_definitions(),
             )
-            request_id = f"{run_id}:step:{step}"
+            request_id = (
+                f"{run_id}:step:{step}:request:"
+                f"{self.recorder.current_sequence(run_id) + 1}"
+            )
             self._record(
                 run_id,
                 "model_request_started",
@@ -532,16 +682,23 @@ class Agent:
             verification=verification.snapshot(),
             max_steps=self.max_steps,
             require_verification=self.require_verification,
-            llm_identity=self._llm_identity(),
+            llm_identity=self.llm_identity(),
             tool_schema_sha256=tool_schema_fingerprint(self.tools.list_tools()),
             workspace=workspace_identity(self.tools.root),
+            permission_policy_identity=self.permission_policy_identity(),
         )
         self.recorder.save_snapshot(snapshot)
 
-    def _llm_identity(self) -> str:
+    def llm_identity(self) -> str:
         model = getattr(self.llm, "model", None)
         suffix = f":{model}" if model else ""
         return f"{type(self.llm).__module__}.{type(self.llm).__qualname__}{suffix}"
+
+    def permission_policy_identity(self) -> str:
+        return (
+            f"{type(self.permission_policy).__module__}."
+            f"{type(self.permission_policy).__qualname__}"
+        )
 
     @staticmethod
     def _permission_denied(call: ToolCall, reason: str) -> ToolResult:

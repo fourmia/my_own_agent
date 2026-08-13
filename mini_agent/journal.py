@@ -24,6 +24,7 @@ EventType = Literal[
     "verification_updated",
     "completion_blocked",
     "snapshot_saved",
+    "run_resumed",
     "run_completed",
     "run_failed",
 ]
@@ -66,6 +67,14 @@ _REQUIRED_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "completion_blocked": frozenset({"step", "required_tools", "verification"}),
     "snapshot_saved": frozenset(
         {"snapshot_id", "artifact_id", "last_event_sequence", "sha256"}
+    ),
+    "run_resumed": frozenset(
+        {
+            "from_snapshot_sequence",
+            "previous_journal_sequence",
+            "resume_point",
+            "next_step",
+        }
     ),
     "run_completed": frozenset({"steps", "finish_reason"}),
     "run_failed": frozenset({"exception_type"}),
@@ -119,6 +128,14 @@ class EventStore(Protocol):
 
     def load(self, run_id: str) -> list[RunEvent]:
         """按 sequence 升序读取一次运行的全部事件。"""
+
+    def claim_resume(
+        self,
+        run_id: str,
+        expected_sequence: int,
+        payload: dict[str, Any],
+    ) -> RunEvent:
+        """仅当 Journal 未变化时原子追加 run_resumed，防止并发重复恢复。"""
 
 
 def new_run_id() -> str:
@@ -261,6 +278,79 @@ class SQLiteEventStore:
                         schema_version,
                         created_at,
                         payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        run_id,
+                        sequence,
+                        event_type,
+                        1,
+                        created_at,
+                        payload_json,
+                    ),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+            finally:
+                cursor.close()
+
+        return RunEvent(
+            event_id=event_id,
+            run_id=run_id,
+            sequence=sequence,
+            event_type=event_type,
+            schema_version=1,
+            created_at=created_at,
+            payload=cleaned,
+        )
+
+    def claim_resume(
+        self,
+        run_id: str,
+        expected_sequence: int,
+        payload: dict[str, Any],
+    ) -> RunEvent:
+        """以 compare-and-append 方式取得一次恢复执行权。"""
+
+        event_type = _validate_event_payload("run_resumed", payload)
+        cleaned = sanitize_payload(payload)
+        if not isinstance(cleaned, dict):
+            raise TypeError("event payload must be an object")
+        payload_json = json.dumps(
+            cleaned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        event_id = f"evt-{uuid.uuid4().hex}"
+        created_at = datetime.now(timezone.utc).isoformat()
+
+        with self._lock:
+            cursor = self._connection.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                row = cursor.execute(
+                    """
+                    SELECT COALESCE(MAX(sequence), 0) AS latest_sequence
+                    FROM run_events
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                latest_sequence = int(row["latest_sequence"])
+                if latest_sequence != expected_sequence:
+                    raise RuntimeError(
+                        "resume claim conflict: journal changed after analysis"
+                    )
+                sequence = latest_sequence + 1
+                cursor.execute(
+                    """
+                    INSERT INTO run_events (
+                        event_id, run_id, sequence, event_type,
+                        schema_version, created_at, payload_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
