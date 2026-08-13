@@ -235,7 +235,14 @@ def create_default_registry(root: Path) -> ToolRegistry:
     """
 
     registry = ToolRegistry(root)
-    ignored_directories = {".git", "__pycache__", ".pytest_cache", ".venv", "venv"}
+    ignored_directories = {
+        ".git",
+        ".mini_agent",
+        "__pycache__",
+        ".pytest_cache",
+        ".venv",
+        "venv",
+    }
 
     def is_ignored(path: Path) -> bool:
         # 工具输出会进入模型上下文；缓存、虚拟环境和安装元数据既耗 Token，也会干扰候选排序。

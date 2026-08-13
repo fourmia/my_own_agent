@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from typing import Any
 
+from mini_agent.journal import (
+    EventStore,
+    EventType,
+    content_summary,
+    new_run_id,
+)
 from mini_agent.llm import LLM
 from mini_agent.permissions import (
     ApprovalHandler,
@@ -27,14 +35,15 @@ class AgentResult:
     answer: str
     steps: int
     messages: list[Message]
+    run_id: str | None = None
 
 
 class Agent:
     """把 LLM、工具和消息历史串起来的最小 Agent Runtime。
 
-    一次模型轮次可以返回零到多个工具调用。Runtime 保留 Provider 返回的顺序，
-    逐个执行调用，并且等这一批结果全部进入历史后才请求下一轮模型。这样可以
-    在尚未引入并发、审批和写冲突策略前，先固定可回放的协议语义。
+    一次模型轮次可以返回零到多个工具调用。Runtime 按 Provider 顺序执行，
+    并且等这一批结果全部进入历史后才请求下一轮模型。权限、日志和验证状态
+    都位于 handler 外层，因此副作用发生前后的关键边界可以被审计。
     """
 
     def __init__(
@@ -48,6 +57,7 @@ class Agent:
         retry_policy: ProviderRetryPolicy | None = None,
         require_verification: bool = True,
         system_prompt: str | None = None,
+        event_store: EventStore | None = None,
     ) -> None:
         # 依赖注入：Agent 不关心具体模型是哪家，也不关心工具怎么实现。
         # 这让我们可以先用 MockLLM 学习，之后再替换成真实 Provider Adapter。
@@ -58,12 +68,45 @@ class Agent:
         self.retry_policy = retry_policy or ProviderRetryPolicy()
         self.require_verification = require_verification
         self.system_prompt = system_prompt
+        self.event_store = event_store
 
         # max_steps 是安全阀。真实模型可能误判、循环调用工具，甚至被 prompt injection 带偏。
         # 没有步数上限，Agent 可能无限运行、疯狂烧钱或不断修改文件。
         self.max_steps = max_steps
 
     def run(self, task: str, trace: bool = True) -> AgentResult:
+        run_id = new_run_id()
+        self._record(
+            run_id,
+            "run_started",
+            {
+                "task": content_summary(task),
+                "max_steps": self.max_steps,
+                "require_verification": self.require_verification,
+                "tools": [tool.name for tool in self.tools.list_tools()],
+            },
+        )
+        try:
+            return self._run_loop(task, trace=trace, run_id=run_id)
+        except Exception as error:
+            # 不允许记录失败覆盖真正的 Runtime 异常；尤其当原始异常就是日志写入
+            # 失败时，第二次写入也可能失败，但仍应把第一次异常交给宿主。
+            try:
+                self._record(
+                    run_id,
+                    "run_failed",
+                    {
+                        "exception_type": type(error).__name__,
+                        "provider_error_code": (
+                            error.code if isinstance(error, ProviderError) else None
+                        ),
+                    },
+                )
+            except Exception:  # noqa: BLE001 - preserve the original Runtime failure
+                pass
+            raise
+
+    def _run_loop(self, task: str, *, trace: bool, run_id: str) -> AgentResult:
         # 对话历史从用户任务开始。后面每一轮 assistant/tool 消息都会追加进来。
         messages: list[Message] = []
         if self.system_prompt:
@@ -80,17 +123,85 @@ class Agent:
                 messages=list(messages),
                 tools=self.tools.list_definitions(),
             )
-            response = self.retry_policy.generate(
-                self.llm,
-                request,
-                on_retry=(
-                    lambda attempt, delay, error: self._trace_retry(
-                        attempt,
-                        delay,
-                        error,
-                        trace=trace,
-                    )
-                ),
+            request_id = f"{run_id}:step:{step}"
+            self._record(
+                run_id,
+                "model_request_started",
+                {
+                    "request_id": request_id,
+                    "step": step,
+                    "message_count": len(request.messages),
+                    "tool_count": len(request.tools),
+                },
+            )
+            attempt = {"current": 1}
+
+            def on_retry(
+                next_attempt: int,
+                delay: float,
+                error: ProviderError,
+            ) -> None:
+                self._record(
+                    run_id,
+                    "model_request_failed",
+                    {
+                        "request_id": request_id,
+                        "step": step,
+                        "attempt": attempt["current"],
+                        "error_code": error.code,
+                        "retrying": True,
+                        "retry_delay_seconds": delay,
+                        "details": error.details,
+                    },
+                )
+                attempt["current"] = next_attempt
+                self._trace_retry(next_attempt, delay, error, trace=trace)
+
+            try:
+                response = self.retry_policy.generate(
+                    self.llm,
+                    request,
+                    on_retry=on_retry,
+                )
+            except ProviderError as error:
+                self._record(
+                    run_id,
+                    "model_request_failed",
+                    {
+                        "request_id": request_id,
+                        "step": step,
+                        "attempt": attempt["current"],
+                        "error_code": error.code,
+                        "retrying": False,
+                        "details": error.details,
+                    },
+                )
+                raise
+
+            self._record(
+                run_id,
+                "model_request_completed",
+                {
+                    "request_id": request_id,
+                    "step": step,
+                    "attempt": attempt["current"],
+                    "finish_reason": response.finish_reason,
+                    "provider_response_id": response.provider_response_id,
+                    "content": content_summary(response.content),
+                    "tool_calls": [
+                        {"call_id": call.call_id, "tool": call.name}
+                        for call in response.tool_calls
+                    ],
+                    "usage": (
+                        {
+                            "input_tokens": response.usage.input_tokens,
+                            "output_tokens": response.usage.output_tokens,
+                            "total_tokens": response.usage.total_tokens,
+                        }
+                        if response.usage is not None
+                        else None
+                    ),
+                },
             )
 
             # assistant 消息必须持久化整批结构化调用。后续模型需要知道每个
@@ -121,8 +232,23 @@ class Agent:
                     if trace:
                         print(f"\n[step {step}] completion_blocked")
                         print(blocked)
+                    self._record(
+                        run_id,
+                        "completion_blocked",
+                        {
+                            "step": step,
+                            "required_tools": missing,
+                            "verification": verification.snapshot(),
+                        },
+                    )
                     continue
-                return AgentResult(response.content, step, messages)
+                return self._complete_run(
+                    run_id,
+                    response.content,
+                    step,
+                    messages,
+                    finish_reason=response.finish_reason or "completed",
+                )
 
             # 逐个执行同一 ModelTurn 中的调用。一个工具失败不阻止同批次后续调用；
             # 是否 fail-fast 属于未来 Permission/Policy 层，而不是 handler 的职责。
@@ -141,8 +267,21 @@ class Agent:
                 # 权限检查发生在 handler 之前。deny/未批准 ask 会生成普通 ToolResult，
                 # 模型可以看到拒绝原因，但任何文件或进程副作用都不会发生。
                 tool = self.tools.get(call.name)
-                result = self._execute_call(call, tool)
+                result = self._execute_call(call, tool, run_id=run_id)
+                before_verification = verification.snapshot()
                 verification.observe(tool, result)
+                after_verification = verification.snapshot()
+                if after_verification != before_verification:
+                    self._record(
+                        run_id,
+                        "verification_updated",
+                        {
+                            "call_id": call.call_id,
+                            "tool": call.name,
+                            "effect": tool.effect if tool is not None else "none",
+                            "state": after_verification,
+                        },
+                    )
                 observation = result.to_observation()
                 messages.append(
                     Message(
@@ -160,18 +299,151 @@ class Agent:
         # 到达上限时明确停止，并把停止原因也写进消息历史，方便调试。
         final = f"Stopped after reaching max_steps={self.max_steps}."
         messages.append(Message("assistant", final))
-        return AgentResult(final, self.max_steps, messages)
+        return self._complete_run(
+            run_id,
+            final,
+            self.max_steps,
+            messages,
+            finish_reason="max_steps",
+        )
 
-    def _execute_call(self, call: ToolCall, tool: Tool | None) -> ToolResult:
+    def _execute_call(
+        self,
+        call: ToolCall,
+        tool: Tool | None,
+        *,
+        run_id: str,
+    ) -> ToolResult:
         if tool is None:
-            return self.tools.run(call)
+            result = self.tools.run(call)
+            self._record(
+                run_id,
+                "tool_execution_skipped",
+                {
+                    "call_id": call.call_id,
+                    "tool": call.name,
+                    "reason": "unknown_tool",
+                    "error_code": result.error_code,
+                },
+            )
+            return result
 
         decision = self.permission_policy.evaluate(tool, call)
+        approved: bool | None = None
+        if decision.outcome == "ask":
+            approved = self.approval_handler.approve(tool, call)
+        self._record(
+            run_id,
+            "permission_decided",
+            {
+                "call_id": call.call_id,
+                "tool": call.name,
+                "permission": tool.permission,
+                "outcome": decision.outcome,
+                "reason": decision.reason,
+                "approved": approved,
+            },
+        )
         if decision.outcome == "deny":
-            return self._permission_denied(call, decision.reason)
-        if decision.outcome == "ask" and not self.approval_handler.approve(tool, call):
-            return self._permission_denied(call, "approval was not granted")
-        return self.tools.run(call)
+            result = self._permission_denied(call, decision.reason)
+            self._record_skipped_tool(run_id, call, tool, result)
+            return result
+        if decision.outcome == "ask" and not approved:
+            result = self._permission_denied(call, "approval was not granted")
+            self._record_skipped_tool(run_id, call, tool, result)
+            return result
+
+        self._record(
+            run_id,
+            "tool_execution_started",
+            {
+                "call_id": call.call_id,
+                "tool": call.name,
+                "permission": tool.permission,
+                "effect": tool.effect,
+                "arguments": self._arguments_summary(call),
+            },
+        )
+        result = self.tools.run(call)
+        self._record(
+            run_id,
+            "tool_execution_completed",
+            {
+                "call_id": call.call_id,
+                "tool": call.name,
+                "ok": result.ok,
+                "error_code": result.error_code,
+                "content": content_summary(result.content),
+                "details": result.details,
+            },
+        )
+        return result
+
+    def _record_skipped_tool(
+        self,
+        run_id: str,
+        call: ToolCall,
+        tool: Tool,
+        result: ToolResult,
+    ) -> None:
+        self._record(
+            run_id,
+            "tool_execution_skipped",
+            {
+                "call_id": call.call_id,
+                "tool": call.name,
+                "permission": tool.permission,
+                "effect": tool.effect,
+                "error_code": result.error_code,
+            },
+        )
+
+    @staticmethod
+    def _arguments_summary(call: ToolCall) -> dict[str, Any]:
+        serialized = json.dumps(
+            call.arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        target = call.arguments.get("path")
+        if target is None:
+            target = call.arguments.get("targets")
+        return {
+            "keys": sorted(call.arguments),
+            "target": target,
+            "content": content_summary(serialized),
+        }
+
+    def _complete_run(
+        self,
+        run_id: str,
+        answer: str,
+        steps: int,
+        messages: list[Message],
+        *,
+        finish_reason: str,
+    ) -> AgentResult:
+        self._record(
+            run_id,
+            "run_completed",
+            {
+                "steps": steps,
+                "finish_reason": finish_reason,
+                "answer": content_summary(answer),
+                "message_count": len(messages),
+            },
+        )
+        return AgentResult(answer, steps, messages, run_id=run_id)
+
+    def _record(
+        self,
+        run_id: str,
+        event_type: EventType,
+        payload: dict[str, Any],
+    ) -> None:
+        if self.event_store is not None:
+            self.event_store.append(run_id, event_type, payload)
 
     @staticmethod
     def _permission_denied(call: ToolCall, reason: str) -> ToolResult:

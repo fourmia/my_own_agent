@@ -15,6 +15,15 @@ class VerificationState:
     diff_version: int = 0
     tests_version: int = 0
 
+    def snapshot(self) -> dict[str, int]:
+        """返回可持久化快照，避免 Event Journal 引用后续会变化的对象。"""
+
+        return {
+            "mutation_version": self.mutation_version,
+            "diff_version": self.diff_version,
+            "tests_version": self.tests_version,
+        }
+
     def observe(self, tool: Tool | None, result: ToolResult) -> None:
         if tool is None or not result.ok:
             return

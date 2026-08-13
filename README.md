@@ -8,9 +8,9 @@
 用户目标 -> 模型思考 -> 选择工具 -> 执行工具 -> 观察结果 -> 继续决策 -> 完成
 ```
 
-## 当前阶段：Stage 1 / Iteration 4
+## 当前阶段：Stage 1 / Iteration 5A
 
-项目现在已经形成最小安全执行闭环：同时支持零配置 `MockLLM` 和 OpenAI Responses 非流式 Adapter，Runtime 支持 Provider 重试、工具权限审批、基于文件哈希的局部修改，以及修改后的 diff/测试完成守卫。OpenAI SDK 类型仍被限制在 Provider 模块内，默认测试不访问网络也不需要 API key。
+项目现在已经形成最小可审计执行闭环：同时支持零配置 `MockLLM` 和 OpenAI Responses 非流式 Adapter，Runtime 支持 Provider 重试、工具权限审批、基于文件哈希的局部修改、修改后的完成守卫，以及 SQLite append-only Execution Journal。OpenAI SDK 类型仍被限制在 Provider 模块内，默认测试不访问网络也不需要 API key。
 
 ## 运行
 
@@ -22,6 +22,19 @@ python -m mini_agent "stats README.md"
 python -m mini_agent "read REDME.md"
 python -m mini_agent "run python --version"
 ```
+
+每次 CLI 运行默认把事件写入 `.mini_agent/runs.db`，并输出 `run_id`。检查一次运行：
+
+```powershell
+python -m mini_agent --inspect-run RUN_ID
+python -m mini_agent --inspect-run RUN_ID --journal-path .mini_agent/runs.db
+```
+
+Journal 记录事件顺序、调用关联、权限决定、Provider 尝试和验证版本，但不保存原始任务、模型正文、Patch 内容或工具输出；这些内容只保存长度与 SHA-256 摘要。
+
+如果你是第一次学习 Agent，请先阅读：
+
+- [新手实现指南](docs/beginner-implementation-guide.md)：从最小 Agent Loop 到 Iteration 5A 的完整实现主线、实验和自测题。
 
 接入 OpenAI Provider：
 
@@ -51,17 +64,20 @@ python -m mini_agent "修复失败测试" --provider openai --model MODEL_ID --a
 - `mini_agent/retry.py`：Provider 指数退避和 `Retry-After` 策略
 - `mini_agent/permissions.py`：allow / ask / deny 权限决策与审批器
 - `mini_agent/verification.py`：修改后的 diff / 测试完成守卫
+- `mini_agent/journal.py`：运行事件 Schema、SQLite EventStore 和中断检查
 - `mini_agent/tools.py`：工具注册、参数校验、工具执行
 - `mini_agent/schema.py`：消息、工具调用、工具结果、模型请求和模型轮次
 
 ## 迭代文档
 
+- [新手实现指南](docs/beginner-implementation-guide.md)：新手主线教程，建议首先阅读
 - `docs/stage-1-agent-loop.md`：最小 Agent Loop 的核心概念
 - `docs/iteration-1-tool-contracts.md`：严格工具 Schema、参数校验和结构化错误
 - `docs/iteration-2-error-recovery.md`：完整消息历史、错误分类和多轮文件恢复
 - `docs/iteration-3a-domain-protocol.md`：`call_id`、多工具调用、请求快照和 Provider 合同
 - `docs/iteration-3b-openai-responses.md`：OpenAI Adapter、reasoning item 重放和错误边界
 - `docs/iteration-4-safe-execution.md`：重试边界、权限审批、受控 Patch 和完成验证
+- `docs/iteration-5a-execution-journal.md`：append-only Journal、事件顺序与恢复风险分类
 - `docs/iteration-3-real-llm-design.md`：真实 LLM Adapter、调用关联和多工具协议设计
 - `docs/adr/0001-own-runtime-use-provider-adapters.md`：自研 Runtime、按边界复用开源方案的架构决策
 
@@ -73,6 +89,7 @@ python -m mini_agent "修复失败测试" --provider openai --model MODEL_ID --a
 4. 阅读 `llm.py` 的恢复状态机，确认你能解释为什么自动重试必须有限制。
 5. 阅读 `tests/test_safety_runtime.py`，观察为什么 Provider retry 不会重复执行工具。
 6. 运行测试，重点观察拒绝审批、陈旧哈希和完成阻断三个失败路径。
+7. 执行一个 CLI 任务，再用输出的 `run_id` 检查完整事件时间线。
 
-下一阶段优先增加可观测执行记录和可恢复会话，使每一次审批、修改、验证和 Provider 尝试都能持久化审计；流式事件仍保持为独立的传输层增强。
+下一阶段是 Iteration 5B：在 Journal 之上增加消息快照、Artifact Store 和显式 `resume-run` 状态机。started-only 的写入或执行工具必须先检查实际状态或人工确认，不能自动重放。
 

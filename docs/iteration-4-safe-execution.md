@@ -155,4 +155,4 @@ Runtime 就追加结构化 `completion_blocked` system message 并继续下一�
 - CLI 审批是同步终端输入，没有持久化审批记录和可恢复会话。
 - `git_diff`、测试输出和消息历史只有长度截断，没有统一 artifact 存储。
 
-下一轮应优先实现 execution journal：为 Provider 尝试、权限决策、ToolCall、ToolResult、修改版本和验证证据建立可持久化事件记录。它会为崩溃恢复、审计、评估和后续并发执行提供共同基础。
+上述 execution journal 已在 [Iteration 5A](iteration-5a-execution-journal.md) 实现。下一步是在事件元数据之上增加消息快照、Artifact Store 和显式恢复状态机。

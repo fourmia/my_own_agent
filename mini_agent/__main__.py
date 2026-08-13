@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 from mini_agent.agent import Agent
+from mini_agent.journal import SQLiteEventStore, inspect_run
 from mini_agent.llm import LLM, MockLLM
 from mini_agent.permissions import (
     ApprovalHandler,
@@ -60,7 +64,11 @@ def create_permission_policy(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the mini learning agent.")
-    parser.add_argument("task", help="Task for the agent, for example: 'list files'")
+    parser.add_argument(
+        "task",
+        nargs="?",
+        help="Task for the agent, for example: 'list files'",
+    )
     parser.add_argument(
         "--provider",
         choices=("mock", "openai"),
@@ -90,10 +98,49 @@ def main() -> None:
             "real Providers."
         ),
     )
+    parser.add_argument(
+        "--journal-path",
+        default=".mini_agent/runs.db",
+        help="SQLite execution journal path relative to the workspace.",
+    )
+    parser.add_argument(
+        "--inspect-run",
+        metavar="RUN_ID",
+        help="Print one persisted run timeline instead of starting an Agent.",
+    )
     parser.add_argument("--no-trace", action="store_true", help="Only print final answer.")
     args = parser.parse_args()
 
     root = Path.cwd()
+    journal_path = Path(args.journal_path)
+    if not journal_path.is_absolute():
+        journal_path = root / journal_path
+
+    if args.inspect_run:
+        if args.task is not None:
+            parser.error("task cannot be combined with --inspect-run")
+        try:
+            with SQLiteEventStore(journal_path) as event_store:
+                events = event_store.load(args.inspect_run)
+        except (sqlite3.Error, ValueError) as error:
+            parser.exit(1, f"journal error: {error}\n")
+        if not events:
+            parser.exit(1, f"run not found: {args.inspect_run}\n")
+        inspection = inspect_run(events)
+        print("[run]")
+        print(json.dumps(asdict(inspection), ensure_ascii=False, sort_keys=True))
+        print("\n[events]")
+        for event in events:
+            payload = json.dumps(event.payload, ensure_ascii=False, sort_keys=True)
+            print(
+                f"{event.sequence:04d} {event.created_at} "
+                f"{event.event_type} {payload}"
+            )
+        return
+
+    if args.task is None:
+        parser.error("task is required unless --inspect-run is used")
+
     try:
         llm = create_llm(args, parser)
     except ProviderError as error:
@@ -112,21 +159,28 @@ def main() -> None:
             args.provider,
             args.approval_mode,
         )
-        agent = Agent(
-            llm=llm,
-            tools=tools,
-            permission_policy=permission_policy,
-            approval_handler=approval_handler,
-            retry_policy=ProviderRetryPolicy(
-                max_attempts=args.max_provider_attempts,
-            ),
-            system_prompt=CODING_SYSTEM_PROMPT if args.provider == "openai" else None,
-        )
-        result = agent.run(args.task, trace=not args.no_trace)
+        with SQLiteEventStore(journal_path) as event_store:
+            agent = Agent(
+                llm=llm,
+                tools=tools,
+                permission_policy=permission_policy,
+                approval_handler=approval_handler,
+                retry_policy=ProviderRetryPolicy(
+                    max_attempts=args.max_provider_attempts,
+                ),
+                system_prompt=(
+                    CODING_SYSTEM_PROMPT if args.provider == "openai" else None
+                ),
+                event_store=event_store,
+            )
+            result = agent.run(args.task, trace=not args.no_trace)
     except ProviderError as error:
         # 不打印 headers、请求体或密钥，只暴露稳定错误码和安全消息。
         parser.exit(1, f"provider error [{error.code}]: {error}\n")
+    except sqlite3.Error as error:
+        parser.exit(1, f"journal error: {error}\n")
 
+    print(f"\n[run_id]\n{result.run_id}")
     print("\n[final]")
     print(result.answer)
 
