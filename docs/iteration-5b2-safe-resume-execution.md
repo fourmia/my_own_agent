@@ -156,8 +156,8 @@ python -m pytest -q
 
 测试覆盖：消息历史复用、原 run ID、只读 tool batch、started-only read、安全阻断、Permission Policy 变化、未快照结果、completed Run、原子 claim 和 CLI 端到端恢复。
 
-## 9. 下一步
+## 9. 后续 5B3
 
-5B3 应实现未知副作用的显式 reconciliation，而不是扩大自动重放范围。可从受控 Patch 开始：记录 before/after hash 和目标文件，恢复时只读检查当前文件状态，区分“确定未执行”“确定已执行”“无法判断”，再由用户或策略做出显式决定。
+5B3 已在 [`iteration-5b3-patch-reconciliation.md`](iteration-5b3-patch-reconciliation.md) 中实现受控 Patch 的显式 reconciliation：记录 before/after hash 和目标文件，恢复时只读检查当前文件状态，区分“确定未执行”“确定已执行”“无法判断”。
 
 任意 Shell、外部 API、数据库或测试进程的效果通常无法仅靠 workspace hash 判断，仍需要工具级幂等键、外部状态查询或人工处理。

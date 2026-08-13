@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -28,7 +29,9 @@ from mini_agent.snapshots import (
     tool_schema_fingerprint,
     verification_from_snapshot,
     workspace_identity,
+    workspace_state_sha256,
 )
+from mini_agent.resume_types import PatchReconciliation
 from mini_agent.tools import Tool, ToolRegistry
 from mini_agent.verification import VerificationState
 
@@ -146,6 +149,7 @@ class Agent:
         snapshot: RunSnapshot,
         *,
         expected_journal_sequence: int,
+        reconciliations: tuple[PatchReconciliation, ...] = (),
         trace: bool,
     ) -> AgentResult:
         """仅供 ResumeExecutor 调用；在原子 claim 后恢复已验证状态。"""
@@ -168,8 +172,12 @@ class Agent:
             },
         )
         try:
-            self._validate_claimed_snapshot(snapshot)
-            return self._continue_from_claimed_snapshot(snapshot, trace=trace)
+            self._validate_claimed_snapshot(snapshot, reconciliations)
+            return self._continue_from_claimed_snapshot(
+                snapshot,
+                reconciliations=reconciliations,
+                trace=trace,
+            )
         except Exception as error:
             try:
                 self._record(
@@ -186,7 +194,11 @@ class Agent:
                 pass
             raise
 
-    def _validate_claimed_snapshot(self, snapshot: RunSnapshot) -> None:
+    def _validate_claimed_snapshot(
+        self,
+        snapshot: RunSnapshot,
+        reconciliations: tuple[PatchReconciliation, ...],
+    ) -> None:
         """在 claim 后再次检查易变化的本地身份，缩短竞态窗口。"""
 
         if snapshot.llm_identity != self.llm_identity():
@@ -197,13 +209,31 @@ class Agent:
             self.tools.list_tools()
         ):
             raise RuntimeError("tool schema changed after resume claim")
-        if snapshot.workspace != workspace_identity(self.tools.root):
+        current_workspace = workspace_identity(self.tools.root)
+        reconciled_after_states = {
+            result.expected_after_workspace_sha256
+            for result in reconciliations
+            if (
+                result.status == "executed"
+                and result.expected_before_workspace_sha256
+                == snapshot.workspace.state_sha256
+            )
+        }
+        if (
+            snapshot.workspace.root != current_workspace.root
+            or snapshot.workspace.git_head != current_workspace.git_head
+            or (
+                snapshot.workspace.state_sha256 != current_workspace.state_sha256
+                and current_workspace.state_sha256 not in reconciled_after_states
+            )
+        ):
             raise RuntimeError("workspace identity changed after resume claim")
 
     def _continue_from_claimed_snapshot(
         self,
         snapshot: RunSnapshot,
         *,
+        reconciliations: tuple[PatchReconciliation, ...],
         trace: bool,
     ) -> AgentResult:
         """恢复 claim 成功后重建内存状态；失败由外层记录 run_failed。"""
@@ -215,6 +245,9 @@ class Agent:
 
         if snapshot.resume_point == "tool_batch":
             pending_calls = messages[-1].tool_calls
+            reconciliation_by_call_id = {
+                result.call_id: result for result in reconciliations
+            }
             for call in pending_calls:
                 if trace:
                     print(
@@ -222,11 +255,30 @@ class Agent:
                         f"{call.name}({call.arguments})"
                     )
                 tool = self.tools.get(call.name)
-                if tool is None or tool.permission != "read" or (
-                    tool.effect == "workspace_mutation"
+                reconciliation = reconciliation_by_call_id.get(call.call_id)
+                if (
+                    tool is not None
+                    and tool.name == "apply_patch"
+                    and reconciliation is not None
+                    and reconciliation.status in {"not_executed", "executed"}
                 ):
-                    raise RuntimeError("unsafe tool batch passed resume analysis")
-                result = self._execute_call(call, tool, run_id=snapshot.run_id)
+                    result = self._reconciled_patch_result(call, reconciliation)
+                    self._record(
+                        snapshot.run_id,
+                        "tool_execution_reconciled",
+                        {
+                            "call_id": call.call_id,
+                            "tool": call.name,
+                            "status": reconciliation.status,
+                            "reason": reconciliation.reason,
+                        },
+                    )
+                else:
+                    if tool is None or tool.permission != "read" or (
+                        tool.effect == "workspace_mutation"
+                    ):
+                        raise RuntimeError("unsafe tool batch passed resume analysis")
+                    result = self._execute_call(call, tool, run_id=snapshot.run_id)
                 before_verification = verification.snapshot()
                 verification.observe(tool, result)
                 after_verification = verification.snapshot()
@@ -567,6 +619,7 @@ class Agent:
                 "permission": tool.permission,
                 "effect": tool.effect,
                 "arguments": self._arguments_summary(call),
+                "reconciliation": self._reconciliation_evidence(call, tool),
             },
         )
         result = self.tools.run(call)
@@ -619,6 +672,72 @@ class Agent:
             "target": target,
             "content": content_summary(serialized),
         }
+
+    def _reconciliation_evidence(
+        self,
+        call: ToolCall,
+        tool: Tool,
+    ) -> dict[str, Any] | None:
+        """为受控 Patch 生成不含正文、可在崩溃后验证的状态证据。"""
+
+        if tool.name != "apply_patch" or tool.effect != "workspace_mutation":
+            return None
+        try:
+            path = self.tools.resolve_workspace_path(str(call.arguments["path"]))
+            before = path.read_bytes()
+            before_sha256 = hashlib.sha256(before).hexdigest()
+            if before_sha256 != str(call.arguments["expected_sha256"]).lower():
+                return None
+            text = before.decode("utf-8")
+            old_text = str(call.arguments["old_text"])
+            new_text = str(call.arguments["new_text"])
+            if old_text == new_text or text.count(old_text) != 1:
+                return None
+            after = text.replace(old_text, new_text, 1).encode("utf-8")
+            relative = path.relative_to(self.tools.root).as_posix()
+            return {
+                "kind": "exact_file_patch_v1",
+                "path": relative,
+                "before_sha256": before_sha256,
+                "after_sha256": hashlib.sha256(after).hexdigest(),
+                "workspace_before_sha256": workspace_state_sha256(
+                    self.tools.root
+                ),
+                "workspace_after_sha256": workspace_state_sha256(
+                    self.tools.root,
+                    replacements={relative: after},
+                ),
+            }
+        except (KeyError, OSError, TypeError, UnicodeDecodeError, ValueError):
+            return None
+
+    @staticmethod
+    def _reconciled_patch_result(
+        call: ToolCall,
+        reconciliation: PatchReconciliation,
+    ) -> ToolResult:
+        if reconciliation.status == "executed":
+            return ToolResult(
+                call_id=call.call_id,
+                name=call.name,
+                ok=True,
+                content=(
+                    "Patch outcome was reconciled after interruption: the workspace "
+                    "matches the expected after state. Inspect the diff and run tests."
+                ),
+            )
+        return ToolResult(
+            call_id=call.call_id,
+            name=call.name,
+            ok=False,
+            content=(
+                "Patch outcome was reconciled after interruption: the workspace "
+                "matches the expected before state, so the patch did not execute. "
+                "Do not reuse this call ID; inspect state and issue a new call if needed."
+            ),
+            error_code="reconciled_not_executed",
+            details={"reconciliation_status": reconciliation.status},
+        )
 
     def _complete_run(
         self,

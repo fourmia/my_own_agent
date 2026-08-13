@@ -21,6 +21,7 @@ EventType = Literal[
     "tool_execution_started",
     "tool_execution_completed",
     "tool_execution_skipped",
+    "tool_execution_reconciled",
     "verification_updated",
     "completion_blocked",
     "snapshot_saved",
@@ -63,6 +64,7 @@ _REQUIRED_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     ),
     "tool_execution_completed": frozenset({"call_id", "tool", "ok"}),
     "tool_execution_skipped": frozenset({"call_id", "tool", "error_code"}),
+    "tool_execution_reconciled": frozenset({"call_id", "tool", "status"}),
     "verification_updated": frozenset({"call_id", "tool", "state"}),
     "completion_blocked": frozenset({"step", "required_tools", "verification"}),
     "snapshot_saved": frozenset(
@@ -186,6 +188,11 @@ def _validate_event_payload(event_type: str, payload: dict[str, Any]) -> EventTy
         raise ValueError(
             f"event {event_type} is missing required payload keys: {missing_keys}"
         )
+    if event_type == "tool_execution_reconciled" and payload.get("status") not in {
+        "executed",
+        "not_executed",
+    }:
+        raise ValueError("tool_execution_reconciled has an unsupported status")
     return cast(EventType, event_type)
 
 
@@ -453,7 +460,10 @@ def inspect_run(events: list[RunEvent]) -> RunInspection:
         call_id = str(event.payload.get("call_id", ""))
         if event.event_type == "tool_execution_started":
             pending_starts[call_id] = event
-        elif event.event_type == "tool_execution_completed":
+        elif event.event_type in {
+            "tool_execution_completed",
+            "tool_execution_reconciled",
+        }:
             pending_starts.pop(call_id, None)
 
     incomplete: list[IncompleteToolExecution] = []

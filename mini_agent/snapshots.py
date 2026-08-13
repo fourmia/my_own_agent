@@ -239,7 +239,15 @@ def workspace_identity(root: Path) -> WorkspaceIdentity:
     )
 
 
-def _workspace_tree_sha256(root: Path) -> str:
+def workspace_state_sha256(
+    root: Path,
+    *,
+    replacements: dict[str, bytes] | None = None,
+) -> str:
+    """计算工作区内容树摘要，可用内存字节虚拟替换指定相对文件。"""
+
+    root = root.resolve()
+    replacements = replacements or {}
     ignored = {
         ".git",
         ".mini_agent",
@@ -260,7 +268,9 @@ def _workspace_tree_sha256(root: Path) -> str:
             relative = path.relative_to(root).as_posix()
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
-            if path.is_symlink():
+            if relative in replacements:
+                digest.update(replacements[relative])
+            elif path.is_symlink():
                 digest.update(os.readlink(path).encode("utf-8"))
             else:
                 try:
@@ -271,6 +281,10 @@ def _workspace_tree_sha256(root: Path) -> str:
                     digest.update(f"unreadable:{type(error).__name__}".encode("ascii"))
             digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _workspace_tree_sha256(root: Path) -> str:
+    return workspace_state_sha256(root)
 
 
 def verification_from_snapshot(value: dict[str, int]) -> VerificationState:
@@ -295,4 +309,5 @@ __all__ = [
     "tool_schema_fingerprint",
     "verification_from_snapshot",
     "workspace_identity",
+    "workspace_state_sha256",
 ]

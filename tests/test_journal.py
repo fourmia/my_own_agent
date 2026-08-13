@@ -100,6 +100,16 @@ def test_event_store_rejects_unknown_or_incomplete_event_schema(tmp_path: Path) 
             store.append("run-1", "future_event", {})  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="missing required payload keys"):
             store.append("run-1", "run_completed", {"steps": 1})
+        with pytest.raises(ValueError, match="unsupported status"):
+            store.append(
+                "run-1",
+                "tool_execution_reconciled",
+                {
+                    "call_id": "patch-1",
+                    "tool": "apply_patch",
+                    "status": "indeterminate",
+                },
+            )
 
 
 def test_event_store_revalidates_persisted_rows_on_load(tmp_path: Path) -> None:

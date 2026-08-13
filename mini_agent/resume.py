@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Literal
 
 from mini_agent.agent import Agent, AgentResult
 from mini_agent.artifacts import ArtifactRef
 from mini_agent.journal import EventStore, RunEvent, inspect_run
+from mini_agent.resume_types import PatchReconciliation, PatchReconciliationStatus
 from mini_agent.snapshots import (
     RunSnapshot,
     SnapshotStore,
     tool_schema_fingerprint,
     workspace_identity,
+    workspace_state_sha256,
 )
 from mini_agent.tools import ToolRegistry
 
@@ -136,6 +139,16 @@ class ResumeAnalyzer:
             blockers.append("snapshot_sequence_mismatch")
         if snapshot.resume_point == "run_completion":
             blockers.append("completion_commit_incomplete")
+        patch_reconciliations = self.reconcile(run_id)
+        trusted_patch_reconciliations = self._trusted_patch_reconciliations(
+            snapshot,
+            patch_reconciliations,
+        )
+        determinate_patch_statuses = {
+            item.call_id: item.status
+            for item in trusted_patch_reconciliations
+            if item.status in {"not_executed", "executed"}
+        }
         if snapshot.resume_point == "tool_batch":
             if not snapshot.messages or snapshot.messages[-1].role != "assistant":
                 blockers.append("pending_tool_batch_message_invalid")
@@ -156,6 +169,11 @@ class ResumeAnalyzer:
                 tool = self.tools.get(call.name)
                 if tool is None:
                     blockers.append("pending_tool_unavailable")
+                elif (
+                    tool.name == "apply_patch"
+                    and call.call_id in determinate_patch_statuses
+                ):
+                    warnings.append("patch_reconciled_no_auto_replay")
                 elif tool.permission != "read" or tool.effect == "workspace_mutation":
                     blockers.append("pending_non_read_tool")
         if snapshot.llm_identity != self.llm_identity:
@@ -179,21 +197,50 @@ class ResumeAnalyzer:
         ):
             blockers.append("tool_schema_changed")
 
+        reconciled_executed_patches = [
+            result
+            for result in trusted_patch_reconciliations
+            if result.status == "executed"
+            and result.expected_before_workspace_sha256
+            == snapshot.workspace.state_sha256
+        ]
         current_workspace = workspace_identity(self.tools.root)
         if snapshot.workspace.root != current_workspace.root:
             blockers.append("workspace_root_changed")
         if snapshot.workspace.git_head != current_workspace.git_head:
             blockers.append("git_head_changed")
         if snapshot.workspace.state_sha256 != current_workspace.state_sha256:
-            blockers.append("workspace_state_changed")
+            if any(
+                result.expected_after_workspace_sha256
+                == current_workspace.state_sha256
+                for result in reconciled_executed_patches
+            ):
+                warnings.append("workspace_state_matches_reconciled_patch")
+            else:
+                blockers.append("workspace_state_changed")
 
         if inspection.incomplete_tools:
-            if any(
-                item.disposition == "unknown_outcome"
+            unresolved_unknown_outcomes = []
+            reconciled_patch_call_ids = {
+                result.call_id
+                for result in trusted_patch_reconciliations
+                if result.status in {"not_executed", "executed"}
+            }
+            for item in inspection.incomplete_tools:
+                if item.disposition != "unknown_outcome":
+                    continue
+                if item.tool_name == "apply_patch" and (
+                    item.call_id in reconciled_patch_call_ids
+                ):
+                    warnings.append("patch_reconciled_no_auto_replay")
+                else:
+                    unresolved_unknown_outcomes.append(item)
+            if unresolved_unknown_outcomes:
+                blockers.append("manual_reconciliation_required")
+            elif any(
+                item.disposition == "safe_to_retry"
                 for item in inspection.incomplete_tools
             ):
-                blockers.append("manual_reconciliation_required")
-            else:
                 warnings.append("started_only_read_tool")
 
         tail_events = [
@@ -210,6 +257,7 @@ class ResumeAnalyzer:
             event.event_type in {
                 "tool_execution_completed",
                 "tool_execution_skipped",
+                "tool_execution_reconciled",
             }
             for event in tail_events
         ):
@@ -247,6 +295,138 @@ class ResumeAnalyzer:
                 bytes=int(snapshot_event.payload["bytes"]),
                 media_type=str(snapshot_event.payload["media_type"]),
             )
+        )
+
+    def reconcile(self, run_id: str) -> tuple[PatchReconciliation, ...]:
+        """只读判断 started-only Patch 当前更接近哪个确定状态。"""
+
+        events = self.event_store.load(run_id)
+        inspection = inspect_run(events) if events else None
+        if inspection is None:
+            return ()
+        results: list[PatchReconciliation] = []
+        for item in inspection.incomplete_tools:
+            if item.tool_name != "apply_patch":
+                continue
+            event = next(
+                event
+                for event in events
+                if event.sequence == item.started_sequence
+            )
+            results.append(
+                self._reconcile_patch_event(
+                    run_id,
+                    event,
+                )
+            )
+        return tuple(results)
+
+    def _trusted_patch_reconciliations(
+        self,
+        snapshot: RunSnapshot,
+        results: tuple[PatchReconciliation, ...],
+    ) -> tuple[PatchReconciliation, ...]:
+        """只信任与 Snapshot 原始 ToolCall 和 before workspace 一致的证据。"""
+
+        calls = {
+            call.call_id: call
+            for message in snapshot.messages
+            for call in message.tool_calls
+        }
+        trusted: list[PatchReconciliation] = []
+        for result in results:
+            call = calls.get(result.call_id)
+            if call is None or call.name != "apply_patch":
+                continue
+            try:
+                path = self.tools.resolve_workspace_path(
+                    str(call.arguments["path"])
+                )
+                relative = path.relative_to(self.tools.root).as_posix()
+                expected_before = str(
+                    call.arguments["expected_sha256"]
+                ).lower()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                result.path == relative
+                and result.expected_before_sha256 == expected_before
+                and result.expected_before_workspace_sha256
+                == snapshot.workspace.state_sha256
+            ):
+                trusted.append(result)
+        return tuple(trusted)
+
+    def _reconcile_patch_event(
+        self,
+        run_id: str,
+        event: RunEvent,
+    ) -> PatchReconciliation:
+        evidence = event.payload.get("reconciliation")
+        base = {
+            "run_id": run_id,
+            "call_id": str(event.payload.get("call_id", "")),
+            "tool": str(event.payload.get("tool", "apply_patch")),
+            "started_sequence": event.sequence,
+        }
+        if not isinstance(evidence, dict) or evidence.get("kind") != "exact_file_patch_v1":
+            return PatchReconciliation(
+                **base,
+                status="indeterminate",
+                path=None,
+                reason="missing_patch_evidence",
+                current_file_sha256=None,
+                expected_before_sha256=None,
+                expected_after_sha256=None,
+                current_workspace_sha256=None,
+                expected_before_workspace_sha256=None,
+                expected_after_workspace_sha256=None,
+            )
+        path_value = evidence.get("path")
+        expected_before = str(evidence.get("before_sha256", ""))
+        expected_after = str(evidence.get("after_sha256", ""))
+        expected_workspace_before = str(evidence.get("workspace_before_sha256", ""))
+        expected_workspace_after = str(evidence.get("workspace_after_sha256", ""))
+        try:
+            path = self.tools.resolve_workspace_path(str(path_value))
+            current_file = path.read_bytes()
+            current_file_sha = hashlib.sha256(current_file).hexdigest()
+            current_workspace_sha = workspace_state_sha256(self.tools.root)
+        except (OSError, TypeError, ValueError):
+            current_file_sha = None
+            current_workspace_sha = None
+        common = {
+            **base,
+            "path": str(path_value),
+            "current_file_sha256": current_file_sha,
+            "expected_before_sha256": expected_before,
+            "expected_after_sha256": expected_after,
+            "current_workspace_sha256": current_workspace_sha,
+            "expected_before_workspace_sha256": expected_workspace_before,
+            "expected_after_workspace_sha256": expected_workspace_after,
+        }
+        if (
+            current_file_sha == expected_before
+            and current_workspace_sha == expected_workspace_before
+        ):
+            return PatchReconciliation(
+                **common,
+                status="not_executed",
+                reason="workspace_matches_patch_before_state",
+            )
+        if (
+            current_file_sha == expected_after
+            and current_workspace_sha == expected_workspace_after
+        ):
+            return PatchReconciliation(
+                **common,
+                status="executed",
+                reason="workspace_matches_patch_after_state",
+            )
+        return PatchReconciliation(
+            **common,
+            status="indeterminate",
+            reason="workspace_does_not_match_before_or_after_state",
         )
 
     @staticmethod
@@ -305,14 +485,21 @@ class ResumeExecutor:
         if analysis.decision != "resume_allowed":
             raise ResumeRejectedError(analysis)
         snapshot = self.analyzer.load_latest_snapshot(run_id)
+        reconciliations = self.analyzer._trusted_patch_reconciliations(
+            snapshot,
+            self.analyzer.reconcile(run_id),
+        )
         return self.agent._resume_from_snapshot(
             snapshot,
             expected_journal_sequence=analysis.journal_sequence,
+            reconciliations=reconciliations,
             trace=trace,
         )
 
 
 __all__ = [
+    "PatchReconciliation",
+    "PatchReconciliationStatus",
     "ResumeAnalysis",
     "ResumeAnalyzer",
     "ResumeDecision",

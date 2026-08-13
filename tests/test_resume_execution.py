@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import hashlib
 from pathlib import Path
 import re
 import sys
@@ -14,6 +15,7 @@ from mini_agent.journal import SQLiteEventStore
 from mini_agent.llm import LLM, MockLLM
 from mini_agent.permissions import FullAccessPermissionPolicy
 from mini_agent.resume import ResumeExecutor, ResumeRejectedError
+from mini_agent.resume import ResumeAnalyzer
 from mini_agent.schema import Message, ModelRequest, ModelTurn, ToolCall
 from mini_agent.snapshots import (
     ArtifactSnapshotStore,
@@ -437,3 +439,488 @@ def test_cli_resume_run_completes_a_persisted_mock_session(
         events = reopened.load(run_id)
     assert any(event.event_type == "run_resumed" for event in events)
     assert events[-1].event_type == "run_completed"
+
+
+def _append_started_patch(
+    tmp_path: Path,
+    *,
+    mutate: str | None = None,
+    unrelated_change: bool = False,
+) -> tuple[SQLiteEventStore, ResumeAnalyzer, str]:
+    event_store = SQLiteEventStore(tmp_path / "runs.db")
+    artifact_store = ArtifactSnapshotStore(
+        FileArtifactStore(tmp_path / "artifacts")
+    )
+    agent = Agent(
+        MockLLM(),
+        create_default_registry(tmp_path),
+        event_store=event_store,
+        snapshot_store=artifact_store,
+    )
+    path = tmp_path / "note.txt"
+    path.write_bytes(b"before\n")
+    call = ToolCall(
+        "patch-1",
+        "apply_patch",
+        {
+            "path": "note.txt",
+            "old_text": "before\n",
+            "new_text": "after\n",
+            "expected_sha256": hashlib.sha256(b"before\n").hexdigest(),
+        },
+    )
+    tool = agent.tools.get("apply_patch")
+    assert tool is not None
+    evidence = agent._reconciliation_evidence(call, tool)
+    assert evidence is not None
+    run_id = "run-patch-reconcile"
+    event_store.append(
+        run_id,
+        "run_started",
+        {"task": {"sha256": "task"}, "max_steps": 6},
+    )
+    event_store.append(
+        run_id,
+        "tool_execution_started",
+        {
+            "call_id": call.call_id,
+            "tool": call.name,
+            "permission": "write",
+            "effect": "workspace_mutation",
+            "arguments": {},
+            "reconciliation": evidence,
+        },
+    )
+    if mutate == "after":
+        path.write_bytes(b"after\n")
+    elif mutate == "other":
+        path.write_bytes(b"different\n")
+    if unrelated_change:
+        (tmp_path / "unrelated.txt").write_text("drift\n", encoding="utf-8")
+    analyzer = ResumeAnalyzer(
+        event_store,
+        artifact_store,
+        agent.tools,
+        llm_identity="reconciliation-only",
+    )
+    return event_store, analyzer, run_id
+
+
+def test_patch_reconciliation_distinguishes_before_after_and_drift(
+    tmp_path: Path,
+) -> None:
+    store, analyzer, run_id = _append_started_patch(tmp_path / "before")
+    try:
+        before = analyzer.reconcile(run_id)
+    finally:
+        store.close()
+    assert before[0].status == "not_executed"
+
+    store, analyzer, run_id = _append_started_patch(tmp_path / "after", mutate="after")
+    try:
+        after = analyzer.reconcile(run_id)
+    finally:
+        store.close()
+    assert after[0].status == "executed"
+
+    store, analyzer, run_id = _append_started_patch(
+        tmp_path / "drift",
+        mutate="after",
+        unrelated_change=True,
+    )
+    try:
+        drift = analyzer.reconcile(run_id)
+    finally:
+        store.close()
+    assert drift[0].status == "indeterminate"
+    assert drift[0].reason == "workspace_does_not_match_before_or_after_state"
+
+
+def test_patch_reconciliation_requires_evidence_and_ignores_shell(
+    tmp_path: Path,
+) -> None:
+    event_store = SQLiteEventStore(tmp_path / "runs.db")
+    artifact_store = ArtifactSnapshotStore(
+        FileArtifactStore(tmp_path / "artifacts")
+    )
+    agent = Agent(MockLLM(), create_default_registry(tmp_path), event_store=event_store)
+    run_id = "run-mixed-reconcile"
+    event_store.append(
+        run_id,
+        "run_started",
+        {"task": {"sha256": "task"}, "max_steps": 6},
+    )
+    event_store.append(
+        run_id,
+        "tool_execution_started",
+        {
+            "call_id": "patch-no-evidence",
+            "tool": "apply_patch",
+            "permission": "write",
+            "effect": "workspace_mutation",
+            "arguments": {},
+        },
+    )
+    event_store.append(
+        run_id,
+        "tool_execution_started",
+        {
+            "call_id": "shell-1",
+            "tool": "run_command",
+            "permission": "execute",
+            "effect": "none",
+            "arguments": {},
+        },
+    )
+    analyzer = ResumeAnalyzer(
+        event_store,
+        artifact_store,
+        agent.tools,
+        llm_identity="reconciliation-only",
+    )
+    try:
+        results = analyzer.reconcile(run_id)
+    finally:
+        event_store.close()
+
+    assert len(results) == 1
+    assert results[0].status == "indeterminate"
+    assert results[0].reason == "missing_patch_evidence"
+
+
+def test_patch_reconciliation_evidence_must_match_snapshot_call(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider(
+        [ModelTurn(content="must not run", finish_reason="completed")]
+    )
+    event_store = SQLiteEventStore(tmp_path / "runs.db")
+    snapshots = ArtifactSnapshotStore(FileArtifactStore(tmp_path / "artifacts"))
+    agent = Agent(
+        provider,
+        create_default_registry(tmp_path),
+        permission_policy=FullAccessPermissionPolicy(),
+        event_store=event_store,
+        snapshot_store=snapshots,
+    )
+    path = tmp_path / "note.txt"
+    path.write_bytes(b"before\n")
+    call = ToolCall(
+        "patch-1",
+        "apply_patch",
+        {
+            "path": "note.txt",
+            "old_text": "before\n",
+            "new_text": "after\n",
+            "expected_sha256": hashlib.sha256(b"before\n").hexdigest(),
+        },
+    )
+    tool = agent.tools.get("apply_patch")
+    assert tool is not None
+    evidence = agent._reconciliation_evidence(call, tool)
+    assert evidence is not None
+    evidence["before_sha256"] = "0" * 64
+    run_id = _persist_interrupted_snapshot(
+        event_store,
+        snapshots,
+        agent,
+        resume_point="tool_batch",
+        messages=[
+            Message("user", "patch"),
+            Message("assistant", "patching", tool_calls=(call,)),
+        ],
+        seen_call_ids=[call.call_id],
+    )
+    event_store.append(
+        run_id,
+        "tool_execution_started",
+        {
+            "call_id": call.call_id,
+            "tool": call.name,
+            "permission": "write",
+            "effect": "workspace_mutation",
+            "arguments": {},
+            "reconciliation": evidence,
+        },
+    )
+    try:
+        with pytest.raises(ResumeRejectedError) as rejected:
+            ResumeExecutor(agent).run(run_id, trace=False)
+    finally:
+        event_store.close()
+
+    assert rejected.value.analysis.decision == "manual_reconciliation_required"
+    assert provider.requests == []
+
+
+def test_reconciled_executed_patch_allows_next_model_request_without_replay(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider(
+        [ModelTurn(content="continue after patch", finish_reason="completed")]
+    )
+    event_store = SQLiteEventStore(tmp_path / "runs.db")
+    snapshots = ArtifactSnapshotStore(FileArtifactStore(tmp_path / "artifacts"))
+    agent = Agent(
+        provider,
+        create_default_registry(tmp_path),
+        permission_policy=FullAccessPermissionPolicy(),
+        require_verification=False,
+        event_store=event_store,
+        snapshot_store=snapshots,
+    )
+    path = tmp_path / "note.txt"
+    path.write_bytes(b"before\n")
+    call = ToolCall(
+        "patch-1",
+        "apply_patch",
+        {
+            "path": "note.txt",
+            "old_text": "before\n",
+            "new_text": "after\n",
+            "expected_sha256": hashlib.sha256(b"before\n").hexdigest(),
+        },
+    )
+    tool = agent.tools.get("apply_patch")
+    assert tool is not None
+    evidence = agent._reconciliation_evidence(call, tool)
+    assert evidence is not None
+    run_id = "run-reconciled-patch"
+    event_store.append(
+        run_id,
+        "run_started",
+        {"task": {"sha256": "task"}, "max_steps": agent.max_steps},
+    )
+    snapshot = RunSnapshot(
+        run_id=run_id,
+        snapshot_version=SNAPSHOT_SCHEMA_VERSION,
+        last_event_sequence=1,
+        next_step=2,
+        resume_point="tool_batch",
+        messages=[
+            Message("user", "patch note"),
+            Message("assistant", "patching", tool_calls=(call,)),
+        ],
+        seen_call_ids=[call.call_id],
+        verification={
+            "mutation_version": 0,
+            "diff_version": 0,
+            "tests_version": 0,
+        },
+        max_steps=agent.max_steps,
+        require_verification=agent.require_verification,
+        llm_identity=agent.llm_identity(),
+        tool_schema_sha256=tool_schema_fingerprint(agent.tools.list_tools()),
+        workspace=workspace_identity(tmp_path),
+        permission_policy_identity=agent.permission_policy_identity(),
+    )
+    ref = snapshots.save(snapshot)
+    event_store.append(
+        run_id,
+        "snapshot_saved",
+        {
+            "snapshot_id": f"{run_id}:snapshot:1",
+            "artifact_id": ref.artifact_id,
+            "last_event_sequence": 1,
+            "sha256": ref.sha256,
+            "bytes": ref.bytes,
+            "media_type": ref.media_type,
+        },
+    )
+    event_store.append(
+        run_id,
+        "tool_execution_started",
+        {
+            "call_id": call.call_id,
+            "tool": call.name,
+            "permission": "write",
+            "effect": "workspace_mutation",
+            "arguments": {},
+            "reconciliation": evidence,
+        },
+    )
+    path.write_bytes(b"after\n")
+    try:
+        result = ResumeExecutor(agent).run(run_id, trace=False)
+        events = event_store.load(run_id)
+    finally:
+        event_store.close()
+
+    assert result.answer == "continue after patch"
+    assert provider.requests
+    assert [event.event_type for event in events].count("tool_execution_started") == 1
+    assert any(
+        event.event_type == "run_resumed" for event in events
+    )
+    verification_event = next(
+        event for event in events if event.event_type == "verification_updated"
+    )
+    assert verification_event.payload["state"]["mutation_version"] == 1
+
+
+def test_reconciled_not_executed_patch_reports_failure_without_replay(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedProvider(
+        [ModelTurn(content="continue after missed patch", finish_reason="completed")]
+    )
+    event_store = SQLiteEventStore(tmp_path / "runs.db")
+    snapshots = ArtifactSnapshotStore(FileArtifactStore(tmp_path / "artifacts"))
+    agent = Agent(
+        provider,
+        create_default_registry(tmp_path),
+        permission_policy=FullAccessPermissionPolicy(),
+        require_verification=False,
+        event_store=event_store,
+        snapshot_store=snapshots,
+    )
+    path = tmp_path / "note.txt"
+    path.write_bytes(b"before\n")
+    call = ToolCall(
+        "patch-1",
+        "apply_patch",
+        {
+            "path": "note.txt",
+            "old_text": "before\n",
+            "new_text": "after\n",
+            "expected_sha256": hashlib.sha256(b"before\n").hexdigest(),
+        },
+    )
+    tool = agent.tools.get("apply_patch")
+    assert tool is not None
+    evidence = agent._reconciliation_evidence(call, tool)
+    assert evidence is not None
+    run_id = "run-not-executed-patch"
+    event_store.append(
+        run_id,
+        "run_started",
+        {"task": {"sha256": "task"}, "max_steps": agent.max_steps},
+    )
+    snapshot = RunSnapshot(
+        run_id=run_id,
+        snapshot_version=SNAPSHOT_SCHEMA_VERSION,
+        last_event_sequence=1,
+        next_step=2,
+        resume_point="tool_batch",
+        messages=[
+            Message("user", "patch note"),
+            Message("assistant", "patching", tool_calls=(call,)),
+        ],
+        seen_call_ids=[call.call_id],
+        verification={
+            "mutation_version": 0,
+            "diff_version": 0,
+            "tests_version": 0,
+        },
+        max_steps=agent.max_steps,
+        require_verification=agent.require_verification,
+        llm_identity=agent.llm_identity(),
+        tool_schema_sha256=tool_schema_fingerprint(agent.tools.list_tools()),
+        workspace=workspace_identity(tmp_path),
+        permission_policy_identity=agent.permission_policy_identity(),
+    )
+    ref = snapshots.save(snapshot)
+    event_store.append(
+        run_id,
+        "snapshot_saved",
+        {
+            "snapshot_id": f"{run_id}:snapshot:1",
+            "artifact_id": ref.artifact_id,
+            "last_event_sequence": 1,
+            "sha256": ref.sha256,
+            "bytes": ref.bytes,
+            "media_type": ref.media_type,
+        },
+    )
+    event_store.append(
+        run_id,
+        "tool_execution_started",
+        {
+            "call_id": call.call_id,
+            "tool": call.name,
+            "permission": "write",
+            "effect": "workspace_mutation",
+            "arguments": {},
+            "reconciliation": evidence,
+        },
+    )
+    try:
+        result = ResumeExecutor(agent).run(run_id, trace=False)
+        events = event_store.load(run_id)
+    finally:
+        event_store.close()
+
+    assert result.answer == "continue after missed patch"
+    assert path.read_bytes() == b"before\n"
+    assert provider.requests[-1].messages[-1].content.startswith("{")
+    assert any(
+        event.event_type == "tool_execution_reconciled"
+        and event.payload["status"] == "not_executed"
+        for event in events
+    )
+
+
+def test_agent_records_exact_patch_evidence_before_handler(tmp_path: Path) -> None:
+    path = tmp_path / "note.txt"
+    path.write_bytes(b"before\n")
+    expected = hashlib.sha256(b"before\n").hexdigest()
+    provider = ScriptedProvider(
+        [
+            ModelTurn(
+                content="patching",
+                tool_calls=(
+                    ToolCall(
+                        "patch-1",
+                        "apply_patch",
+                        {
+                            "path": "note.txt",
+                            "old_text": "before\n",
+                            "new_text": "after\n",
+                            "expected_sha256": expected,
+                        },
+                    ),
+                ),
+                finish_reason="tool_calls",
+            ),
+            ModelTurn(content="done", finish_reason="completed"),
+        ]
+    )
+    with SQLiteEventStore(tmp_path / "runs.db") as store:
+        result = Agent(
+            provider,
+            create_default_registry(tmp_path),
+            permission_policy=FullAccessPermissionPolicy(),
+            require_verification=False,
+            event_store=store,
+        ).run("patch", trace=False)
+        events = store.load(result.run_id or "")
+
+    started = next(event for event in events if event.event_type == "tool_execution_started")
+    evidence = started.payload["reconciliation"]
+    assert evidence["kind"] == "exact_file_patch_v1"
+    assert evidence["path"] == "note.txt"
+    assert evidence["before_sha256"] == expected
+    assert evidence["after_sha256"] == hashlib.sha256(b"after\n").hexdigest()
+    assert "old_text" not in str(evidence)
+    assert "new_text" not in str(evidence)
+
+
+def test_cli_reconcile_run_is_read_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    store, _, run_id = _append_started_patch(tmp_path)
+    store.close()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["mini-agent", "--journal-path", "runs.db", "--reconcile-run", run_id],
+    )
+
+    main()
+
+    output = capsys.readouterr().out
+    assert '"status": "not_executed"' in output
+    assert (tmp_path / "note.txt").read_bytes() == b"before\n"

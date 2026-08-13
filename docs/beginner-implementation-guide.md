@@ -2,7 +2,7 @@
 
 这是一份面向新手的主线教程。它不假设你已经理解 Agent、Tool Calling、Provider Adapter、权限策略或事件日志，只要求你能阅读基础 Python。
 
-本教程从项目最早的最小循环讲到当前 Iteration 5B2。读完后，你应该不仅知道“每个文件做什么”，还应该能解释：为什么必须按这个顺序迭代、每一层解决了什么失败模式，以及哪些设计会严重影响 Agent 的准确度。
+本教程从项目最早的最小循环讲到当前 Iteration 5B3。读完后，你应该不仅知道“每个文件做什么”，还应该能解释：为什么必须按这个顺序迭代、每一层解决了什么失败模式，以及哪些设计会严重影响 Agent 的准确度。
 
 > 本文讲的是当前代码的真实实现。早期专题文档保留了当时的演进过程，个别早期字段已经被后续版本升级；遇到差异时，以当前源码和本文为准。
 
@@ -1209,6 +1209,32 @@ Provider、模型、审批模式、工具 Schema、`max_steps`、验证策略和
 
 对应测试：`tests/test_resume_execution.py`。掌握标准：你能解释为什么 `claim_resume` 必须发生在 Provider/Tool 之前，以及为什么 completed ToolResult 反而不能简单重跑。
 
+### 9.12 Iteration 5B3：Patch 未知结果协调
+
+5B3 第一次处理一个 write 工具的 started-only 状态，但范围极窄：只支持具有文件 before/after hash 的唯一文本 `apply_patch`。Runtime 在 handler 前记录目标路径、文件前后 hash，以及整个 workspace 的前后内容树 hash；它不把 Patch 正文放入 Journal。
+
+恢复前可以只读运行：
+
+```powershell
+python -m mini_agent --reconcile-run RUN_ID
+```
+
+结论只有三种：
+
+| 结论 | 同时满足的条件 | 后续行为 |
+| --- | --- | --- |
+| `not_executed` | 文件与 workspace 都等于 before | 给模型失败 observation；不重放旧 Patch |
+| `executed` | 文件与 workspace 都等于 after | 给模型成功 observation；仍要 diff/test |
+| `indeterminate` | 缺证据或任何内容漂移 | 保持人工协调阻断 |
+
+为什么必须比较整个 workspace？因为目标文件恰好等于 after，并不能证明其他文件没有被并发修改。若存在额外变化，模型在恢复后面对的状态已经不是原 Patch 的确定结果，系统必须停止自动猜测。
+
+确定结果会记录为 `tool_execution_reconciled`，不是伪造的 completed 事件。`not_executed` 返回 `reconciled_not_executed`，模型若仍要修改必须生成新的 call ID，并重新走权限和文件 hash；`executed` 会使完成守卫继续要求 diff 和测试。
+
+任意 Shell、测试、网络和数据库效果仍不支持这一规则。它们需要幂等键、外部状态查询、补偿或人工确认，不能从 workspace hash 推断。对应专题：[5B3 Patch 协调](iteration-5b3-patch-reconciliation.md)。
+
+掌握标准：你能解释为什么 `not_executed` 不等于“现在可以偷偷重放”，以及为什么 `executed` 也不等于“任务已经完成”。
+
 ## 10. 把当前完整执行链串起来
 
 下面是一项真实 coding 任务在当前架构中的完整路径：
@@ -1458,14 +1484,14 @@ python -m mini_agent --inspect-run RUN_ID
 
 当前项目已经比“能调用工具的 Demo”可靠很多，但还不是完整生产系统。
 
-### 15.1 Iteration 5B3：未知副作用协调
+### 15.1 Iteration 6：工具级副作用合同
 
-5B1 已实现恢复数据和只读分析，5B2 已实现只读范围的显式恢复。下一步需要实现：
+5B1 已实现恢复数据和只读分析，5B2 已实现受限恢复，5B3 已实现单文件 Patch 协调。下一步需要实现：
 
-- Patch before/after hash 状态检查；
-- “确定未执行 / 确定已执行 / 无法判断”协调结果；
+- 每个有副作用工具的 reconciliation capability 声明；
+- 版本化证据 Schema 与状态查询接口；
 - 人工或策略显式确认接口；
-- 工具级幂等键与外部状态查询合同。
+- 外部系统的幂等键、事务与补偿合同。
 
 write、execute、mutation 不能因为有 Snapshot 就自动重放。任意 Shell 和外部系统副作用尤其需要保守处理。
 
@@ -1531,6 +1557,7 @@ Streaming 应被设计为传输事件，最终仍组装成同一个 `ModelTurn` 
 - `iteration-5a-execution-journal.md`：事件 Schema、事务和恢复风险；
 - `iteration-5b1-recovery-foundation.md`：Artifact、Snapshot、指纹和恢复分析；
 - `iteration-5b2-safe-resume-execution.md`：原子 claim 和受限恢复状态机；
+- `iteration-5b3-patch-reconciliation.md`：受控 Patch 的三态协调与恢复 observation；
 - `adr/0001-own-runtime-use-provider-adapters.md`：为什么自研 Runtime，并通过 Adapter 复用 Provider SDK。
 
 建议不要只读文档。每读完一个阶段，运行对应测试，并尝试预测消息、调用和事件的准确顺序。Agent 工程真正需要掌握的不是某个框架 API，而是这些跨模型、工具和持久化边界仍然成立的协议。

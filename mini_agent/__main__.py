@@ -22,7 +22,11 @@ from mini_agent.permissions import (
 from mini_agent.provider_errors import ProviderError
 from mini_agent.providers import OpenAIResponsesAdapter
 from mini_agent.retry import ProviderRetryPolicy
-from mini_agent.resume import ResumeAnalyzer, ResumeExecutor, ResumeRejectedError
+from mini_agent.resume import (
+    ResumeAnalyzer,
+    ResumeExecutor,
+    ResumeRejectedError,
+)
 from mini_agent.snapshots import ArtifactSnapshotStore
 from mini_agent.tools import create_coding_registry, create_default_registry
 
@@ -121,6 +125,11 @@ def main() -> None:
         metavar="RUN_ID",
         help="Resume a run only after conservative recovery checks pass.",
     )
+    parser.add_argument(
+        "--reconcile-run",
+        metavar="RUN_ID",
+        help="Inspect started-only Patch outcomes without executing anything.",
+    )
     parser.add_argument("--no-trace", action="store_true", help="Only print final answer.")
     args = parser.parse_args()
 
@@ -132,19 +141,29 @@ def main() -> None:
 
     inspection_options = [
         option
-        for option in (args.inspect_run, args.analyze_resume, args.resume_run)
+        for option in (
+            args.inspect_run,
+            args.analyze_resume,
+            args.resume_run,
+            args.reconcile_run,
+        )
         if option is not None
     ]
     if inspection_options:
         if len(inspection_options) > 1:
             parser.error(
-                "--inspect-run, --analyze-resume and --resume-run are mutually exclusive"
+                "inspection, reconciliation and resume options are mutually exclusive"
             )
         if args.task is not None:
             parser.error("task cannot be combined with inspection options")
         try:
             with SQLiteEventStore(journal_path) as event_store:
-                target_run = args.inspect_run or args.analyze_resume or args.resume_run
+                target_run = (
+                    args.inspect_run
+                    or args.analyze_resume
+                    or args.resume_run
+                    or args.reconcile_run
+                )
                 if args.analyze_resume:
                     if args.provider == "openai" and not args.model:
                         parser.error(
@@ -181,6 +200,28 @@ def main() -> None:
                     print(
                         json.dumps(
                             asdict(analyzer.analyze(target_run)),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+                    return
+                if args.reconcile_run:
+                    analyzer = ResumeAnalyzer(
+                        event_store,
+                        ArtifactSnapshotStore(FileArtifactStore(artifacts_path)),
+                        (
+                            create_default_registry(root)
+                            if args.provider == "mock"
+                            else create_coding_registry(root)
+                        ),
+                        llm_identity="reconciliation-only",
+                    )
+                    print(
+                        json.dumps(
+                            [
+                                asdict(item)
+                                for item in analyzer.reconcile(target_run)
+                            ],
                             ensure_ascii=False,
                             sort_keys=True,
                         )
