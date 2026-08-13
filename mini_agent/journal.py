@@ -23,6 +23,7 @@ EventType = Literal[
     "tool_execution_skipped",
     "verification_updated",
     "completion_blocked",
+    "snapshot_saved",
     "run_completed",
     "run_failed",
 ]
@@ -63,6 +64,9 @@ _REQUIRED_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "tool_execution_skipped": frozenset({"call_id", "tool", "error_code"}),
     "verification_updated": frozenset({"call_id", "tool", "state"}),
     "completion_blocked": frozenset({"step", "required_tools", "verification"}),
+    "snapshot_saved": frozenset(
+        {"snapshot_id", "artifact_id", "last_event_sequence", "sha256"}
+    ),
     "run_completed": frozenset({"steps", "finish_reason"}),
     "run_failed": frozenset({"exception_type"}),
 }

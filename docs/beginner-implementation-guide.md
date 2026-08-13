@@ -1,8 +1,8 @@
-# Mini Agent 从零实现指南：从 Agent Loop 到可审计执行
+# Mini Agent 从零实现指南：从 Agent Loop 到可分析恢复
 
 这是一份面向新手的主线教程。它不假设你已经理解 Agent、Tool Calling、Provider Adapter、权限策略或事件日志，只要求你能阅读基础 Python。
 
-本教程从项目最早的最小循环讲到当前 Iteration 5A。读完后，你应该不仅知道“每个文件做什么”，还应该能解释：为什么必须按这个顺序迭代、每一层解决了什么失败模式，以及哪些设计会严重影响 Agent 的准确度。
+本教程从项目最早的最小循环讲到当前 Iteration 5B1。读完后，你应该不仅知道“每个文件做什么”，还应该能解释：为什么必须按这个顺序迭代、每一层解决了什么失败模式，以及哪些设计会严重影响 Agent 的准确度。
 
 > 本文讲的是当前代码的真实实现。早期专题文档保留了当时的演进过程，个别早期字段已经被后续版本升级；遇到差异时，以当前源码和本文为准。
 
@@ -16,7 +16,7 @@
 | 第二次 | 第 4～5 节 | 理解 Schema、信任边界、错误 observation 和恢复 |
 | 第三次 | 第 6～7 节 | 理解领域协议、call ID 和真实 Provider Adapter |
 | 第四次 | 第 8 节 | 理解权限、受控修改、重试边界和完成验证 |
-| 第五次 | 第 9～17 节 | 理解 Journal、完整架构、准确度因素和扩展方法 |
+| 第五次 | 第 9～17 节 | 理解 Journal、Snapshot、恢复分析、准确度因素和扩展方法 |
 
 每次学习采用相同方法：
 
@@ -1117,7 +1117,7 @@ python -m mini_agent --inspect-run RUN_ID
 
 Journal 默认路径是 `.mini_agent/runs.db`，该目录被 Git 和文件工具忽略，不会污染代码提交或模型上下文。
 
-### 9.9 为什么 5A 还不能 `resume-run`
+### 9.9 5A 为什么还不能 `resume-run`
 
 安全恢复至少还需要：
 
@@ -1129,11 +1129,58 @@ Journal 默认路径是 `.mini_agent/runs.db`，该目录被 Git 和文件工具
 - 恢复时重新执行权限策略；
 - 对运行配置和工具版本做兼容校验。
 
-因此当前准确表述是：“可以审计并识别恢复风险”，不是“可以自动恢复”。
+因此 5A 的准确表述是：“可以审计并识别恢复风险”，不是“可以自动恢复”。
 
 对应测试：`tests/test_journal.py`。
 
 掌握标准：你能解释为什么 started-only 的 `read_file` 与 started-only 的 `apply_patch` 必须采用不同恢复策略。
+
+### 9.10 Iteration 5B1：可恢复会话的数据基础
+
+5B1 补齐“恢复需要什么事实”，仍然不执行恢复。它增加三组对象：
+
+```text
+RunRecorder
+  -> Event Journal：动作顺序和审计事实
+  -> RunSnapshot：重新请求模型所需的完整 Runtime 状态
+  -> Artifact Store：按内容哈希保存 Snapshot 正文
+```
+
+`RunSnapshot` 保存完整消息历史、已经使用的 call ID、验证版本、下一步编号、运行上限、LLM identity、工具 Schema 指纹，以及 workspace root、Git HEAD 和内容树指纹。Journal 继续只保存摘要，避免把 Prompt、代码和工具输出复制进审计数据库。
+
+Snapshot 有三个恢复点：
+
+| `resume_point` | Snapshot 表达的状态 | 5B1 的处理 |
+| --- | --- | --- |
+| `model_request` | 上一批结果已进入消息历史 | 可以分析是否允许从下一轮模型请求继续 |
+| `tool_batch` | 模型已返回完整调用，工具尚未开始 | 可以分析调用是否仍处于无未知副作用的窗口 |
+| `run_completion` | 最终答案已形成，完成事件尚未提交 | 阻断并报告完成提交不完整 |
+
+保存顺序非常重要。例如模型返回工具调用后，Runtime 先把完整 ToolCall 写进 `tool_batch` Snapshot，再写权限和 started 事件并执行 handler。这样在动作开始前崩溃时不会丢失参数，在动作开始后崩溃时又能通过 Journal 识别 unknown outcome。
+
+`FileArtifactStore` 使用 SHA-256 内容寻址。相同 Snapshot 自动去重，写入使用临时文件、`fsync` 和原子替换；读取时重新验证哈希和字节数。Artifact 被篡改时，分析器拒绝使用它。
+
+恢复分析命令：
+
+```powershell
+python -m mini_agent --analyze-resume RUN_ID
+python -m mini_agent --provider openai --model MODEL_ID --analyze-resume RUN_ID
+```
+
+`ResumeAnalyzer` 不调用 Provider，也不执行 Tool。它检查 Snapshot 序列、Artifact 完整性、LLM/工具指纹、工作区状态、未完成工具和 Snapshot 后的事件，最后返回：
+
+| 决策 | 含义 |
+| --- | --- |
+| `resume_allowed` | 数据一致且没有未知副作用；可进入未来 5B2 的恢复范围 |
+| `already_completed` | 已有完成事件，不应重复运行 |
+| `manual_reconciliation_required` | write、execute 或 mutation 可能已经发生 |
+| `resume_blocked` | Snapshot、配置、工作区或事件序列不一致 |
+
+分析时必须使用原运行相同的 Provider、模型和工具集。默认命令代表 Mock 运行；OpenAI 运行必须显式传入原模型，否则保守地报告 identity 或工具 Schema 变化。5B1 的准确表述是：“已保存恢复证据，并能判断是否具备恢复前提”，仍不是“已经自动恢复”。
+
+对应源码：`mini_agent/artifacts.py`、`mini_agent/snapshots.py`、`mini_agent/recorder.py` 和 `mini_agent/resume.py`。对应测试：`tests/test_resume_foundation.py`。
+
+掌握标准：你能解释为什么 Snapshot 不能替代 Journal，以及为什么 `resume_allowed` 只是允许进入恢复状态机，不等于已经执行恢复。
 
 ## 10. 把当前完整执行链串起来
 
@@ -1384,17 +1431,16 @@ python -m mini_agent --inspect-run RUN_ID
 
 当前项目已经比“能调用工具的 Demo”可靠很多，但还不是完整生产系统。
 
-### 15.1 Iteration 5B：可恢复会话
+### 15.1 Iteration 5B2：执行受限恢复
 
-需要实现：
+5B1 已实现 Message Snapshot、内容寻址 Artifact Store、工作区与 Git identity 和只读恢复分析。下一步需要实现：
 
-- Message Snapshot；
-- 加密或受控 Artifact Store；
-- 工作区和 Git revision 身份；
 - `resume-run` 显式状态机；
 - completed ToolCall 结果复用；
-- unknown outcome reconcile；
+- started-only read 工具的受控重试；
 - 恢复前权限重新确认。
+
+write、execute、mutation 的 unknown outcome 协调仍应保持独立边界，不能在 5B2 中自动重放。
 
 ### 15.2 真正进程沙箱
 
@@ -1440,7 +1486,9 @@ Streaming 应被设计为传输事件，最终仍组装成同一个 `ModelTurn` 
 11. append-only Journal 比一张“当前状态表”多保留了什么？
 12. 为什么 started-only Patch 不能自动重放？
 13. 为什么 5A 有 Journal 仍不能安全恢复完整会话？
-14. 哪些问题属于模型准确度，哪些属于 Runtime 协议正确性？
+14. Snapshot 为什么不能替代 append-only Journal？
+15. `resume_allowed` 为什么不等于“工具可以直接重放”？
+16. 哪些问题属于模型准确度，哪些属于 Runtime 协议正确性？
 
 ## 17. 后续专题阅读
 
@@ -1454,6 +1502,7 @@ Streaming 应被设计为传输事件，最终仍组装成同一个 `ModelTurn` 
 - `iteration-3-real-llm-design.md`：真实 Provider 的完整设计背景；
 - `iteration-4-safe-execution.md`：权限、受控 Patch 和验证守卫；
 - `iteration-5a-execution-journal.md`：事件 Schema、事务和恢复风险；
+- `iteration-5b1-recovery-foundation.md`：Artifact、Snapshot、指纹和恢复分析；
 - `adr/0001-own-runtime-use-provider-adapters.md`：为什么自研 Runtime，并通过 Adapter 复用 Provider SDK。
 
 建议不要只读文档。每读完一个阶段，运行对应测试，并尝试预测消息、调用和事件的准确顺序。Agent 工程真正需要掌握的不是某个框架 API，而是这些跨模型、工具和持久化边界仍然成立的协议。

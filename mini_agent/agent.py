@@ -10,6 +10,7 @@ from mini_agent.journal import (
     content_summary,
     new_run_id,
 )
+from mini_agent.recorder import RunRecorder
 from mini_agent.llm import LLM
 from mini_agent.permissions import (
     ApprovalHandler,
@@ -20,6 +21,14 @@ from mini_agent.permissions import (
 from mini_agent.provider_errors import ProviderError
 from mini_agent.retry import ProviderRetryPolicy
 from mini_agent.schema import Message, ModelRequest, ToolCall, ToolResult
+from mini_agent.snapshots import (
+    ArtifactSnapshotStore,
+    SnapshotStore,
+    RunSnapshot,
+    SNAPSHOT_SCHEMA_VERSION,
+    tool_schema_fingerprint,
+    workspace_identity,
+)
 from mini_agent.tools import Tool, ToolRegistry
 from mini_agent.verification import VerificationState
 
@@ -58,6 +67,7 @@ class Agent:
         require_verification: bool = True,
         system_prompt: str | None = None,
         event_store: EventStore | None = None,
+        snapshot_store: SnapshotStore | None = None,
     ) -> None:
         # 依赖注入：Agent 不关心具体模型是哪家，也不关心工具怎么实现。
         # 这让我们可以先用 MockLLM 学习，之后再替换成真实 Provider Adapter。
@@ -68,7 +78,7 @@ class Agent:
         self.retry_policy = retry_policy or ProviderRetryPolicy()
         self.require_verification = require_verification
         self.system_prompt = system_prompt
-        self.event_store = event_store
+        self.recorder = RunRecorder(event_store, snapshot_store)
 
         # max_steps 是安全阀。真实模型可能误判、循环调用工具，甚至被 prompt injection 带偏。
         # 没有步数上限，Agent 可能无限运行、疯狂烧钱或不断修改文件。
@@ -114,6 +124,14 @@ class Agent:
         messages.append(Message("user", task))
         seen_call_ids: set[str] = set()
         verification = VerificationState()
+        self._save_snapshot(
+            run_id,
+            messages,
+            seen_call_ids,
+            verification,
+            next_step=1,
+            resume_point="model_request",
+        )
 
         for step in range(1, self.max_steps + 1):
             # 只把 ToolDefinition 交给模型，避免 Provider 看到本地 Python handler。
@@ -218,6 +236,27 @@ class Agent:
                 print(f"\n[step {step}] assistant")
                 print(response.content)
 
+            # ToolCall 一旦由 Provider 发出，就占用 session 内的 call_id。先验证并
+            # 持久化 tool_batch 快照，随后才执行任何 handler；恢复时因此拥有完整参数。
+            if response.tool_calls:
+                batch_call_ids = [call.call_id for call in response.tool_calls]
+                if len(batch_call_ids) != len(set(batch_call_ids)):
+                    raise ValueError("duplicate ToolCall.call_id within one tool batch")
+                reused = sorted(set(batch_call_ids).intersection(seen_call_ids))
+                if reused:
+                    raise ValueError(
+                        f"duplicate ToolCall.call_id in Agent session: {reused[0]}"
+                    )
+                seen_call_ids.update(batch_call_ids)
+                self._save_snapshot(
+                    run_id,
+                    messages,
+                    seen_call_ids,
+                    verification,
+                    next_step=step,
+                    resume_point="tool_batch",
+                )
+
             # 没有工具调用代表模型给出了最终文本、拒绝或不完整结果；这些状态都
             # 需要交给上层展示，不能因为没有工具就继续盲目循环。
             if not response.tool_calls:
@@ -241,23 +280,28 @@ class Agent:
                             "verification": verification.snapshot(),
                         },
                     )
+                    self._save_snapshot(
+                        run_id,
+                        messages,
+                        seen_call_ids,
+                        verification,
+                        next_step=step + 1,
+                        resume_point="model_request",
+                    )
                     continue
                 return self._complete_run(
                     run_id,
                     response.content,
                     step,
                     messages,
+                    verification=verification,
+                    seen_call_ids=seen_call_ids,
                     finish_reason=response.finish_reason or "completed",
                 )
 
             # 逐个执行同一 ModelTurn 中的调用。一个工具失败不阻止同批次后续调用；
             # 是否 fail-fast 属于未来 Permission/Policy 层，而不是 handler 的职责。
             for call in response.tool_calls:
-                if call.call_id in seen_call_ids:
-                    raise ValueError(
-                        f"duplicate ToolCall.call_id in Agent session: {call.call_id}"
-                    )
-                seen_call_ids.add(call.call_id)
                 if trace:
                     print(
                         f"\n[step {step}] tool_call[{call.call_id}]: "
@@ -296,6 +340,15 @@ class Agent:
                     print(f"\n[step {step}] observation[{result.call_id}]")
                     print(observation)
 
+            self._save_snapshot(
+                run_id,
+                messages,
+                seen_call_ids,
+                verification,
+                next_step=step + 1,
+                resume_point="model_request",
+            )
+
         # 到达上限时明确停止，并把停止原因也写进消息历史，方便调试。
         final = f"Stopped after reaching max_steps={self.max_steps}."
         messages.append(Message("assistant", final))
@@ -304,6 +357,8 @@ class Agent:
             final,
             self.max_steps,
             messages,
+            verification=verification,
+            seen_call_ids=seen_call_ids,
             finish_reason="max_steps",
         )
 
@@ -422,8 +477,18 @@ class Agent:
         steps: int,
         messages: list[Message],
         *,
+        verification: VerificationState,
+        seen_call_ids: set[str],
         finish_reason: str,
     ) -> AgentResult:
+        self._save_snapshot(
+            run_id,
+            messages,
+            seen_call_ids,
+            verification,
+            next_step=steps,
+            resume_point="run_completion",
+        )
         self._record(
             run_id,
             "run_completed",
@@ -442,8 +507,41 @@ class Agent:
         event_type: EventType,
         payload: dict[str, Any],
     ) -> None:
-        if self.event_store is not None:
-            self.event_store.append(run_id, event_type, payload)
+        self.recorder.record(run_id, event_type, payload)
+
+    def _save_snapshot(
+        self,
+        run_id: str,
+        messages: list[Message],
+        seen_call_ids: set[str],
+        verification: VerificationState,
+        *,
+        next_step: int,
+        resume_point: str,
+    ) -> None:
+        if self.recorder.snapshot_store is None:
+            return
+        snapshot = RunSnapshot(
+            run_id=run_id,
+            snapshot_version=SNAPSHOT_SCHEMA_VERSION,
+            last_event_sequence=self.recorder.current_sequence(run_id),
+            next_step=next_step,
+            resume_point=resume_point,
+            messages=list(messages),
+            seen_call_ids=sorted(seen_call_ids),
+            verification=verification.snapshot(),
+            max_steps=self.max_steps,
+            require_verification=self.require_verification,
+            llm_identity=self._llm_identity(),
+            tool_schema_sha256=tool_schema_fingerprint(self.tools.list_tools()),
+            workspace=workspace_identity(self.tools.root),
+        )
+        self.recorder.save_snapshot(snapshot)
+
+    def _llm_identity(self) -> str:
+        model = getattr(self.llm, "model", None)
+        suffix = f":{model}" if model else ""
+        return f"{type(self.llm).__module__}.{type(self.llm).__qualname__}{suffix}"
 
     @staticmethod
     def _permission_denied(call: ToolCall, reason: str) -> ToolResult:

@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from mini_agent.agent import Agent
+from mini_agent.artifacts import FileArtifactStore
 from mini_agent.journal import SQLiteEventStore, inspect_run
 from mini_agent.llm import LLM, MockLLM
 from mini_agent.permissions import (
@@ -21,6 +22,8 @@ from mini_agent.permissions import (
 from mini_agent.provider_errors import ProviderError
 from mini_agent.providers import OpenAIResponsesAdapter
 from mini_agent.retry import ProviderRetryPolicy
+from mini_agent.resume import ResumeAnalyzer
+from mini_agent.snapshots import ArtifactSnapshotStore
 from mini_agent.tools import create_coding_registry, create_default_registry
 
 
@@ -108,6 +111,11 @@ def main() -> None:
         metavar="RUN_ID",
         help="Print one persisted run timeline instead of starting an Agent.",
     )
+    parser.add_argument(
+        "--analyze-resume",
+        metavar="RUN_ID",
+        help="Analyze resumability without calling a Provider or executing tools.",
+    )
     parser.add_argument("--no-trace", action="store_true", help="Only print final answer.")
     args = parser.parse_args()
 
@@ -115,17 +123,52 @@ def main() -> None:
     journal_path = Path(args.journal_path)
     if not journal_path.is_absolute():
         journal_path = root / journal_path
+    artifacts_path = journal_path.parent / "artifacts"
 
-    if args.inspect_run:
+    if args.inspect_run or args.analyze_resume:
+        if args.inspect_run and args.analyze_resume:
+            parser.error("--inspect-run and --analyze-resume cannot be combined")
         if args.task is not None:
-            parser.error("task cannot be combined with --inspect-run")
+            parser.error("task cannot be combined with inspection options")
         try:
             with SQLiteEventStore(journal_path) as event_store:
-                events = event_store.load(args.inspect_run)
+                target_run = args.inspect_run or args.analyze_resume
+                if args.analyze_resume:
+                    if args.provider == "openai" and not args.model:
+                        parser.error(
+                            "--model is required when analyzing an OpenAI run"
+                        )
+                    tools = (
+                        create_default_registry(root)
+                        if args.provider == "mock"
+                        else create_coding_registry(root)
+                    )
+                    llm_identity = (
+                        "mini_agent.llm.MockLLM"
+                        if args.provider == "mock"
+                        else f"mini_agent.providers.openai_responses.OpenAIResponsesAdapter:{args.model}"
+                    )
+                    analyzer = ResumeAnalyzer(
+                        event_store,
+                        ArtifactSnapshotStore(
+                            FileArtifactStore(artifacts_path)
+                        ),
+                        tools,
+                        llm_identity=llm_identity,
+                    )
+                    print(
+                        json.dumps(
+                            asdict(analyzer.analyze(target_run)),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+                    return
+                events = event_store.load(target_run)
         except (sqlite3.Error, ValueError) as error:
             parser.exit(1, f"journal error: {error}\n")
         if not events:
-            parser.exit(1, f"run not found: {args.inspect_run}\n")
+            parser.exit(1, f"run not found: {target_run}\n")
         inspection = inspect_run(events)
         print("[run]")
         print(json.dumps(asdict(inspection), ensure_ascii=False, sort_keys=True))
@@ -160,6 +203,9 @@ def main() -> None:
             args.approval_mode,
         )
         with SQLiteEventStore(journal_path) as event_store:
+            snapshot_store = ArtifactSnapshotStore(
+                FileArtifactStore(artifacts_path)
+            )
             agent = Agent(
                 llm=llm,
                 tools=tools,
@@ -172,6 +218,7 @@ def main() -> None:
                     CODING_SYSTEM_PROMPT if args.provider == "openai" else None
                 ),
                 event_store=event_store,
+                snapshot_store=snapshot_store,
             )
             result = agent.run(args.task, trace=not args.no_trace)
     except ProviderError as error:
